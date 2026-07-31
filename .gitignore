@@ -1,0 +1,6 @@
+transcripts/
+venv/
+har_archive/
+chroma/
+.DS_Store
+__pycache__/
