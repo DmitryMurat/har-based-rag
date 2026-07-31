@@ -35,7 +35,7 @@ from tqdm import tqdm
 CHUNK_RE = re.compile(r"/storage/chunk/[^/]+/[^/]+/([^/]+)/(\d+)\.bin")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_TERMS_FILE = PROJECT_ROOT / "transcripts" / "terms.txt"
+DEFAULT_TERMS_FILE = PROJECT_ROOT / "data" / "terms.txt"
 
 # Реестр одновременно активных прогресс-баров (по позиции/строке терминала). Когда бар
 # открывается или закрывается, нужно принудительно перерисовать ОСТАЛЬНЫЕ активные бары —
@@ -193,7 +193,7 @@ def run(cmd: list[str]) -> None:
 
 
 SUSPICIOUS_MARKER = "# === ПОДОЗРИТЕЛЬНЫЕ ТЕРМИНЫ"
-DEFAULT_LATIN_ALLOWLIST_FILE = PROJECT_ROOT / "transcripts" / "allowlist.txt"
+DEFAULT_LATIN_ALLOWLIST_FILE = PROJECT_ROOT / "data" / "allowlist.txt"
 LOW_CONFIDENCE_THRESHOLD = -0.5
 
 # Защищает чтение-изменение-запись terms.txt в append_suspicious_terms — при параллельной
@@ -230,7 +230,7 @@ def load_initial_prompt(terms_file: Path) -> str | None:
 def find_suspicious_words(text: str, allowlist: set[str] | None = None) -> set[str]:
     """Слова со смешением кириллицы и латиницы (почти всегда артефакт распознавания) и слова
     целиком на латинице, не входящие в allowlist уже подтверждённых обычных терминов
-    (см. transcripts/allowlist.txt / load_latin_allowlist)."""
+    (см. data/allowlist.txt / load_latin_allowlist)."""
     if allowlist is None:
         allowlist = load_latin_allowlist()
     suspicious = set()

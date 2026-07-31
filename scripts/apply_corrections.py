@@ -130,7 +130,7 @@ def main() -> None:
     ap.add_argument("--transcripts-dir", type=Path, default=process_har.PROJECT_ROOT / "transcripts",
                      help="Папка с транскриптами (по умолчанию transcripts/)")
     ap.add_argument("--terms", dest="terms_file", type=Path, default=process_har.DEFAULT_TERMS_FILE,
-                     help="Файл со словарём терминов (по умолчанию transcripts/terms.txt)")
+                     help="Файл со словарём терминов (по умолчанию data/terms.txt)")
     ap.add_argument("--no-reindex", action="store_true",
                      help="Не пересобирать векторный индекс автоматически после исправлений")
     args = ap.parse_args()
