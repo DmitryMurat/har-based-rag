@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>RAG по видеоурокам</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; color: #222; }
+  h1 { font-size: 20px; }
+  #question-row { display: flex; gap: 8px; }
+  #question { flex: 1; padding: 10px; font-size: 15px; box-sizing: border-box; }
+  #ask { padding: 8px 20px; font-size: 15px; cursor: pointer; }
+  #answer { margin-top: 24px; white-space: pre-wrap; line-height: 1.5; }
+  #sources { margin-top: 16px; font-size: 13px; color: #555; }
+  #sources ul { padding-left: 20px; }
+  #status { color: #888; font-size: 13px; margin-top: 8px; }
+</style>
+</head>
+<body>
+  <h1>Введите вопрос по загруженным видеоурокам</h1>
+  <div id="question-row">
+    <input id="question" type="text" placeholder="Введите вопрос и нажмите Enter">
+    <button id="ask">Спросить</button>
+  </div>
+  <div id="status"></div>
+  <div id="answer"></div>
+  <div id="sources"></div>
+
+<script>
+const questionInput = document.getElementById("question");
+const askButton = document.getElementById("ask");
+const statusEl = document.getElementById("status");
+const answerEl = document.getElementById("answer");
+const sourcesEl = document.getElementById("sources");
+
+async function ask() {
+  const question = questionInput.value.trim();
+  if (!question) return;
+
+  askButton.disabled = true;
+  statusEl.textContent = "Ищу ответ...";
+  answerEl.textContent = "";
+  sourcesEl.innerHTML = "";
+
+  try {
+    const res = await fetch("/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+    const data = await res.json();
+
+    if (!res.ok) {
+      statusEl.textContent = "Ошибка: " + (data.error || res.status);
+      return;
+    }
+
+    statusEl.textContent = "";
+    answerEl.textContent = data.answer;
+
+    if (data.sources && data.sources.length) {
+      const items = data.sources
+        .map(s => `<li>${s.item_name} [${s.start}-${s.end} сек]</li>`)
+        .join("");
+      sourcesEl.innerHTML = "<b>Источники:</b><ul>" + items + "</ul>";
+    }
+  } catch (e) {
+    statusEl.textContent = "Ошибка соединения с сервером: " + e;
+  } finally {
+    askButton.disabled = false;
+  }
+}
+
+askButton.addEventListener("click", ask);
+questionInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") ask();
+});
+
+// Heartbeat — пока страница открыта, сервер знает, что он ещё нужен.
+setInterval(() => {
+  fetch("/ping").catch(() => {});
+}, 3000);
+
+// Мгновенное закрытие сервера при закрытии/уходе со страницы.
+function notifyShutdown() {
+  navigator.sendBeacon("/shutdown");
+}
+window.addEventListener("pagehide", notifyShutdown);
+window.addEventListener("beforeunload", notifyShutdown);
+</script>
+</body>
+</html>
