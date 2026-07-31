@@ -290,10 +290,10 @@ def append_suspicious_terms(new_terms: list[str], terms_file: Path) -> int:
             if existing and not existing.endswith("\n"):
                 existing += "\n"
             existing += (
-                "\n" + SUSPICIOUS_MARKER + " (автоматически обнаружены, НЕ используются как "
-                "словарь для Whisper) ===\n"
-                "# Проверьте по аудио/видео. Настоящий термин — перенесите строку выше этой "
-                "отметки. Ошибка распознавания — просто удалите строку.\n"
+                "\n" + SUSPICIOUS_MARKER + " ===\n"
+                "# Автоматически обнаруженные кандидаты — НЕ используются как словарь\n"
+                "# для Whisper. Настоящий термин — перенесите строку выше этой отметки.\n"
+                "# Ошибка распознавания — просто удалите строку.\n"
             )
         if not existing.endswith("\n"):
             existing += "\n"
