@@ -89,6 +89,12 @@ def transcribe_worker(wav_path, slug, item_name, out_dir, model, language, terms
         ok = False
     finally:
         slot_pool.put(slot)
+    if ok:
+        # Тихо, без сообщений в консоль — пополняем карантинный блок terms.txt на лету.
+        try:
+            process_har.scan_transcripts_for_suspicious_terms([out_dir / f"{slug}.json"], terms_file)
+        except Exception:
+            pass
     return ok
 
 

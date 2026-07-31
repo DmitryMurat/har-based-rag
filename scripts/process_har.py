@@ -192,16 +192,133 @@ def run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
+SUSPICIOUS_MARKER = "# === ПОДОЗРИТЕЛЬНЫЕ ТЕРМИНЫ"
+DEFAULT_LATIN_ALLOWLIST_FILE = PROJECT_ROOT / "transcripts" / "allowlist.txt"
+LOW_CONFIDENCE_THRESHOLD = -0.5
+
+# Защищает чтение-изменение-запись terms.txt в append_suspicious_terms — при параллельной
+# транскрибации (--threads > 1) несколько потоков могут закончить и захотеть дописать файл
+# почти одновременно, без лока это гонка данных (можно потерять чужую запись).
+_terms_file_lock = threading.Lock()
+
+
+def load_latin_allowlist(allowlist_file: Path = DEFAULT_LATIN_ALLOWLIST_FILE) -> set[str]:
+    if not allowlist_file.exists():
+        return set()
+    return {
+        line.strip().lower() for line in allowlist_file.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+
+
 def load_initial_prompt(terms_file: Path) -> str | None:
     if not terms_file.exists():
         return None
-    terms = [
-        line.strip() for line in terms_file.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
+    terms = []
+    for line in terms_file.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(SUSPICIOUS_MARKER):
+            break  # дальше — карантинный блок с неподтверждёнными находками, его не используем
+        if not stripped or stripped.startswith("#"):
+            continue
+        terms.append(stripped)
     if not terms:
         return None
     return ", ".join(terms)
+
+
+def find_suspicious_words(text: str, allowlist: set[str] | None = None) -> set[str]:
+    """Слова со смешением кириллицы и латиницы (почти всегда артефакт распознавания) и слова
+    целиком на латинице, не входящие в allowlist уже подтверждённых обычных терминов
+    (см. transcripts/allowlist.txt / load_latin_allowlist)."""
+    if allowlist is None:
+        allowlist = load_latin_allowlist()
+    suspicious = set()
+    for w in re.findall(r"[A-Za-zА-Яа-яЁё]+", text):
+        has_latin = bool(re.search(r"[A-Za-z]", w))
+        has_cyrillic = bool(re.search(r"[А-Яа-яЁё]", w))
+        if has_latin and has_cyrillic:
+            suspicious.add(w)
+        elif has_latin and len(w) >= 2 and w.lower() not in allowlist:
+            suspicious.add(w)
+    return suspicious
+
+
+def find_low_confidence_segments(segments: list[dict]) -> list[str]:
+    """Фразы, которые сам Whisper распознал с низкой уверенностью (avg_logprob) — кандидаты на
+    ручную проверку, даже без явных признаков смешения алфавитов."""
+    return [
+        seg["text"] for seg in segments
+        if seg.get("avg_logprob") is not None and seg["avg_logprob"] < LOW_CONFIDENCE_THRESHOLD and seg["text"]
+    ]
+
+
+def _term_base(line: str) -> str:
+    """Левая часть строки до '=>' (если есть), иначе строка целиком — база для сравнения
+    независимо от того, голый ли это термин, ещё не разобранный кандидат 'термин =>' или уже
+    готовая связка 'термин => исправление'."""
+    return line.split("=>", 1)[0].strip()
+
+
+def collect_known_terms(terms_file: Path) -> set[str]:
+    """Базовые термины (без учёта '=>'), которые уже есть в файле — и подтверждённые, и уже в
+    карантине — чтобы не предлагать одно и то же повторно."""
+    if not terms_file.exists():
+        return set()
+    return {
+        _term_base(line.strip()) for line in terms_file.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+
+
+def append_suspicious_terms(new_terms: list[str], terms_file: Path) -> int:
+    """Дописывает новые подозрительные термины в карантинный блок terms_file в формате
+    'термин =>' (без правой части — значит ещё не разобран, apply_corrections.py такие строки
+    не трогает). Отдельно от подтверждённого словаря — эти строки НЕ используются как
+    initial_prompt для Whisper (см. load_initial_prompt). Возвращает число реально добавленных
+    новых строк."""
+    if not new_terms:
+        return 0
+    with _terms_file_lock:
+        known = collect_known_terms(terms_file)
+        to_add = [t for t in dict.fromkeys(new_terms) if t not in known]
+        if not to_add:
+            return 0
+
+        existing = terms_file.read_text(encoding="utf-8") if terms_file.exists() else ""
+        if SUSPICIOUS_MARKER not in existing:
+            if existing and not existing.endswith("\n"):
+                existing += "\n"
+            existing += (
+                "\n" + SUSPICIOUS_MARKER + " (автоматически обнаружены, НЕ используются как "
+                "словарь для Whisper) ===\n"
+                "# Проверьте по аудио/видео. Настоящий термин — перенесите строку выше этой "
+                "отметки. Ошибка распознавания — просто удалите строку.\n"
+            )
+        if not existing.endswith("\n"):
+            existing += "\n"
+        existing += "\n".join(f"{t} =>" for t in to_add) + "\n"
+        terms_file.write_text(existing, encoding="utf-8")
+        return len(to_add)
+
+
+def scan_transcripts_for_suspicious_terms(
+    json_paths: list[Path], terms_file: Path, allowlist_file: Path = DEFAULT_LATIN_ALLOWLIST_FILE,
+) -> int:
+    """Discovery подозрительных терминов по указанным транскриптам (после транскрибации) —
+    дописывает новые находки в карантинный блок terms_file. Возвращает число новых находок."""
+    allowlist = load_latin_allowlist(allowlist_file)
+    found: list[str] = []
+    for jf in json_paths:
+        try:
+            data = json.loads(jf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        segments = data.get("segments", [])
+        for seg in segments:
+            found.extend(sorted(find_suspicious_words(seg.get("text", ""), allowlist)))
+        found.extend(find_low_confidence_segments(segments))
+    return append_suspicious_terms(found, terms_file)
 
 
 def prepare_audio(har_path: Path | list[Path], slug: str, out_dir: Path, log, keep_raw: bool = False) -> Path:
@@ -280,7 +397,10 @@ def transcribe_audio(
             duration = info.duration or 1.0
 
             for seg in segments_iter:
-                segments.append({"start": round(seg.start, 2), "end": round(seg.end, 2), "text": seg.text.strip()})
+                segments.append({
+                    "start": round(seg.start, 2), "end": round(seg.end, 2), "text": seg.text.strip(),
+                    "avg_logprob": round(seg.avg_logprob, 3),
+                })
                 full_text_parts.append(seg.text.strip())
                 last_pct = int(100 * min(1.0, seg.end / duration))
                 draw(last_pct / 100)
