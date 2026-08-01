@@ -22,10 +22,12 @@ import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import ask  # noqa: E402
 import chromadb  # noqa: E402
+import play_har  # noqa: E402
 from fastembed import TextEmbedding  # noqa: E402
 
 STATIC_HTML = Path(__file__).resolve().parent / "web.html"
@@ -75,6 +77,7 @@ class Handler(BaseHTTPRequestHandler):
     collection = None
     embedder = None
     top_k = 5
+    archive_dir: Path = None
 
     def log_message(self, fmt, *args) -> None:
         pass  # тише в консоли — не логируем каждый heartbeat
@@ -88,7 +91,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        if self.path == "/":
+        parsed = urlsplit(self.path)
+
+        if parsed.path == "/":
             touch()
             body = STATIC_HTML.read_text(encoding="utf-8").encode("utf-8")
             self.send_response(200)
@@ -96,19 +101,60 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif self.path == "/styles.css":
+        elif parsed.path == "/styles.css":
             body = STATIC_CSS.read_text(encoding="utf-8").encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/css; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif self.path == "/ping":
+        elif parsed.path == "/audio":
+            touch()
+            request_started()
+            try:
+                self._serve_audio(parse_qs(parsed.query))
+            finally:
+                touch()
+                request_finished()
+        elif parsed.path == "/ping":
             touch()
             self._send_json(200, {"ok": True})
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _serve_audio(self, qs: dict) -> None:
+        item = (qs.get("item") or [""])[0]
+        item = Path(item).name  # защита от обхода пути (../, абсолютные пути и т.п.)
+        if not item:
+            self._send_json(400, {"error": "Не указан item"})
+            return
+
+        har_path = self.archive_dir / f"{item}.har"
+        if not har_path.exists():
+            self._send_json(404, {"error": f"HAR-файл не найден: {item}.har"})
+            return
+
+        try:
+            start_raw = (qs.get("start") or [None])[0]
+            end_raw = (qs.get("end") or [None])[0]
+            start = float(start_raw) if start_raw not in (None, "") else None
+            end = float(end_raw) if end_raw not in (None, "") else None
+        except ValueError:
+            self._send_json(400, {"error": "start/end должны быть числами"})
+            return
+
+        try:
+            audio_bytes = play_har.extract_audio([har_path], start, end)
+        except Exception as e:
+            self._send_json(500, {"error": str(e)})
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(audio_bytes)))
+        self.end_headers()
+        self.wfile.write(audio_bytes)
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", 0))
@@ -152,6 +198,8 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--chroma-dir", type=Path, default=ask.PROJECT_ROOT / "chroma")
     ap.add_argument("--collection", default="items")
+    ap.add_argument("--archive-dir", type=Path, default=ask.PROJECT_ROOT / "har_archive",
+                     help="Папка с архивными .har (для проигрывания фрагментов), по умолчанию har_archive/")
     ap.add_argument("--top-k", type=int, default=5)
     args = ap.parse_args()
 
@@ -167,6 +215,7 @@ def main() -> None:
     Handler.collection = collection
     Handler.embedder = embedder
     Handler.top_k = args.top_k
+    Handler.archive_dir = args.archive_dir
 
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     threading.Thread(target=watchdog, args=(httpd,), daemon=True).start()

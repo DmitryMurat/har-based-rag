@@ -44,6 +44,7 @@
   <div id="status"><span id="status-text"></span></div>
   <div id="answer"></div>
   <div id="sources"></div>
+  <audio id="audio-player" preload="none"></audio>
 
 <script>
 const themeToggle = document.getElementById("theme-toggle");
@@ -53,6 +54,7 @@ const statusEl = document.getElementById("status");
 const statusTextEl = document.getElementById("status-text");
 const answerEl = document.getElementById("answer");
 const sourcesEl = document.getElementById("sources");
+const audioPlayer = document.getElementById("audio-player");
 
 function formatTimestamp(seconds) {
   const total = Math.trunc(seconds);
@@ -60,6 +62,77 @@ function formatTimestamp(seconds) {
   const s = total % 60;
   return `${m}:${String(s).padStart(2, "0")}`;
 }
+
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+const PLAY_ICON_HTML = `<span class="play-icon">
+  <svg class="icon-play" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M7 5v14l12-7z"/></svg>
+  <svg class="icon-stop" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><rect x="6" y="6" width="12" height="12"/></svg>
+</span>`;
+
+let currentAudioUrl = null;
+
+function stopPlayback() {
+  document.querySelectorAll("#sources .chips li.playing, #sources .chips li.loading")
+    .forEach(el => el.classList.remove("playing", "loading"));
+  audioPlayer.pause();
+  audioPlayer.removeAttribute("src");
+  audioPlayer.load();
+  if (currentAudioUrl) {
+    URL.revokeObjectURL(currentAudioUrl);
+    currentAudioUrl = null;
+  }
+}
+
+async function playSource(li) {
+  const wasPlayingThis = li.classList.contains("playing") || li.classList.contains("loading");
+  stopPlayback();
+  if (wasPlayingThis) return; // повторный клик по тому же фрагменту — просто остановить
+
+  const item = li.dataset.item;
+  const start = li.dataset.start;
+  const end = li.dataset.end;
+  const url = `/audio?item=${encodeURIComponent(item)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
+
+  li.classList.add("loading");
+  setStatus("");
+
+  try {
+    const res = await fetch(url);
+    if (!res.ok) {
+      let message = `Не удалось воспроизвести фрагмент (${res.status}).`;
+      try {
+        const data = await res.json();
+        if (data.error) message = data.error;
+      } catch (_) { /* тело не JSON — оставляем сообщение по умолчанию */ }
+      li.classList.remove("loading");
+      setStatus(message);
+      return;
+    }
+    const blob = await res.blob();
+    if (!li.classList.contains("loading")) return; // пользователь успел кликнуть что-то ещё, пока грузилось
+
+    currentAudioUrl = URL.createObjectURL(blob);
+    audioPlayer.src = currentAudioUrl;
+    li.classList.remove("loading");
+    li.classList.add("playing");
+    await audioPlayer.play();
+  } catch (e) {
+    li.classList.remove("loading");
+    setStatus("Ошибка соединения с сервером: " + e);
+  }
+}
+
+audioPlayer.addEventListener("ended", stopPlayback);
+
+sourcesEl.addEventListener("click", (e) => {
+  const li = e.target.closest("li");
+  if (li) playSource(li);
+});
 
 function setStatus(text) {
   if (!text) {
@@ -80,6 +153,7 @@ async function ask() {
   if (!question) return;
 
   isLoading = true;
+  stopPlayback();
   askButton.classList.add("loading");
   questionInput.readOnly = true;
   setStatus("");
@@ -103,7 +177,12 @@ async function ask() {
 
     if (data.sources && data.sources.length) {
       const items = data.sources
-        .map(s => `<li><span class="src-lesson">${s.item_name}</span><span class="src-time">${formatTimestamp(s.start)} - ${formatTimestamp(s.end)}</span></li>`)
+        .map(s => `<li data-item="${escapeHtml(s.item_name)}" data-start="${s.start}" data-end="${s.end}">` +
+          PLAY_ICON_HTML +
+          `<span class="src-info">` +
+          `<span class="src-lesson">${escapeHtml(s.item_name)}</span>` +
+          `<span class="src-time">${formatTimestamp(s.start)} - ${formatTimestamp(s.end)}</span>` +
+          `</span></li>`)
         .join("");
       sourcesEl.innerHTML = '<ul class="chips">' + items + "</ul>";
     }
