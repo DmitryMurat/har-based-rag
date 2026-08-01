@@ -191,6 +191,7 @@ async function ask() {
 
   isLoading = true;
   stopPlayback();
+  questionInput.setSelectionRange(questionInput.value.length, questionInput.value.length);
   askButton.classList.add("loading");
   questionInput.readOnly = true;
   setStatus("");
