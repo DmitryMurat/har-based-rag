@@ -2,26 +2,26 @@
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RAG по видеоурокам</title>
-<style>
-  body { font-family: -apple-system, "Segoe UI", sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; color: #222; }
-  h1 { font-size: 20px; }
-  #question-row { display: flex; gap: 8px; }
-  #question { flex: 1; padding: 10px; font-size: 15px; box-sizing: border-box; }
-  #ask { padding: 8px 20px; font-size: 15px; cursor: pointer; }
-  #answer { margin-top: 24px; white-space: pre-wrap; line-height: 1.5; }
-  #sources { margin-top: 16px; font-size: 13px; color: #555; }
-  #sources ul { padding-left: 20px; }
-  #status { color: #888; font-size: 13px; margin-top: 8px; }
-</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Google+Sans:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <h1>Введите вопрос по загруженным видеоурокам</h1>
   <div id="question-row">
-    <input id="question" type="text" placeholder="Введите вопрос и нажмите Enter">
-    <button id="ask">Спросить</button>
+    <div class="field-wrap">
+      <input id="question" type="text" placeholder="Введите вопрос и нажмите Enter">
+      <button id="ask" aria-label="Спросить" title="Спросить">
+        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M4 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span class="btn-spinner"></span>
+      </button>
+    </div>
   </div>
-  <div id="status"></div>
+  <div id="status"><span id="status-text"></span></div>
   <div id="answer"></div>
   <div id="sources"></div>
 
@@ -29,15 +29,39 @@
 const questionInput = document.getElementById("question");
 const askButton = document.getElementById("ask");
 const statusEl = document.getElementById("status");
+const statusTextEl = document.getElementById("status-text");
 const answerEl = document.getElementById("answer");
 const sourcesEl = document.getElementById("sources");
 
+function formatTimestamp(seconds) {
+  const total = Math.trunc(seconds);
+  const m = Math.trunc(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function setStatus(text) {
+  if (!text) {
+    statusEl.classList.remove("visible");
+    statusTextEl.textContent = "";
+    return;
+  }
+  statusTextEl.textContent = text;
+  statusEl.classList.add("visible");
+}
+
+let isLoading = false;
+
 async function ask() {
+  if (isLoading) return;
+
   const question = questionInput.value.trim();
   if (!question) return;
 
-  askButton.disabled = true;
-  statusEl.textContent = "Ищу ответ...";
+  isLoading = true;
+  askButton.classList.add("loading");
+  questionInput.readOnly = true;
+  setStatus("");
   answerEl.textContent = "";
   sourcesEl.innerHTML = "";
 
@@ -50,23 +74,24 @@ async function ask() {
     const data = await res.json();
 
     if (!res.ok) {
-      statusEl.textContent = "Ошибка: " + (data.error || res.status);
+      setStatus("Ошибка: " + (data.error || res.status));
       return;
     }
 
-    statusEl.textContent = "";
     answerEl.textContent = data.answer;
 
     if (data.sources && data.sources.length) {
       const items = data.sources
-        .map(s => `<li>${s.item_name} [${s.start}-${s.end} сек]</li>`)
+        .map(s => `<li><span class="src-lesson">${s.item_name}</span><span class="src-time">${formatTimestamp(s.start)} - ${formatTimestamp(s.end)}</span></li>`)
         .join("");
-      sourcesEl.innerHTML = "<b>Источники:</b><ul>" + items + "</ul>";
+      sourcesEl.innerHTML = '<ul class="chips">' + items + "</ul>";
     }
   } catch (e) {
-    statusEl.textContent = "Ошибка соединения с сервером: " + e;
+    setStatus("Ошибка соединения с сервером: " + e);
   } finally {
-    askButton.disabled = false;
+    isLoading = false;
+    askButton.classList.remove("loading");
+    questionInput.readOnly = false;
   }
 }
 

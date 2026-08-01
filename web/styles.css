@@ -1,0 +1,186 @@
+:root {
+  --md-primary: #1a73e8;
+  --md-primary-dark: #1557b0;
+  --md-on-primary: #ffffff;
+  --md-primary-container: #d3e3fd;
+  --md-surface: #fafcff;
+  --md-surface-1: #eef2fa;
+  --md-surface-2: #e4ebf9;
+  --md-outline: #74777f;
+  --md-outline-variant: #c4c6d0;
+  --md-on-surface: #1a1b1f;
+  --md-on-surface-variant: #44474e;
+  --md-error: #ba1a1a;
+  --md-shadow: 0 1px 2px rgba(0,0,0,0.15), 0 1px 3px 1px rgba(0,0,0,0.10);
+  --md-shadow-raised: 0 1px 3px rgba(0,0,0,0.20), 0 4px 8px 3px rgba(0,0,0,0.10);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  font-family: "Roboto", -apple-system, "Segoe UI", sans-serif;
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 48px 20px 80px;
+  color: var(--md-on-surface);
+  background: linear-gradient(180deg, var(--md-surface-1) 0%, var(--md-surface) 260px);
+  min-height: 100vh;
+}
+
+h1 {
+  font-family: "Google Sans", "Roboto", sans-serif;
+  font-size: 22px;
+  font-weight: 500;
+  color: var(--md-on-surface);
+  margin: 0 0 24px;
+  letter-spacing: 0.15px;
+}
+
+#question-row {
+  display: flex;
+  align-items: stretch;
+}
+
+.field-wrap {
+  flex: 1;
+  position: relative;
+}
+
+#question {
+  width: 100%;
+  height: 56px;
+  padding: 0 56px 0 20px;
+  font-family: inherit;
+  font-size: 16px;
+  color: var(--md-on-surface);
+  background: var(--md-surface-1);
+  border: 1px solid var(--md-outline-variant);
+  border-radius: 28px;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+#question::placeholder { color: var(--md-outline); }
+
+#question:hover { border-color: var(--md-on-surface-variant); }
+
+#question:focus {
+  border-color: var(--md-primary);
+  box-shadow: 0 0 0 1px var(--md-primary);
+  background: var(--md-surface);
+}
+
+#question:read-only {
+  color: var(--md-outline);
+  background: var(--md-surface-2);
+  cursor: default;
+}
+#question:read-only:focus {
+  border-color: var(--md-outline-variant);
+  box-shadow: none;
+}
+
+#ask {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  transform: translateY(-50%);
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--md-on-primary);
+  background: var(--md-primary);
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  box-shadow: var(--md-shadow);
+  transition: background 0.15s ease, box-shadow 0.15s ease, transform 0.1s ease;
+}
+
+#ask svg { width: 20px; height: 20px; }
+
+#ask:hover { background: var(--md-primary-dark); box-shadow: var(--md-shadow-raised); }
+#ask:active { transform: translateY(-50%) scale(0.94); }
+
+#ask .btn-spinner {
+  display: none;
+  width: 20px;
+  height: 20px;
+  border: 2px solid rgba(255,255,255,0.4);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+#ask.loading svg { display: none; }
+#ask.loading .btn-spinner { display: block; }
+#ask.loading { cursor: default; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+#status {
+  display: none;
+  text-align: center;
+  color: var(--md-error);
+  font-size: 14px;
+  margin-top: 16px;
+}
+#status.visible { display: block; }
+
+#answer {
+  margin-top: 20px;
+  white-space: pre-wrap;
+  line-height: 1.6;
+  font-size: 15.5px;
+  color: var(--md-on-surface);
+  background: var(--md-surface-1);
+  border-radius: 16px;
+  padding: 0;
+  box-shadow: none;
+  transition: padding 0.15s ease;
+}
+#answer:not(:empty) {
+  padding: 20px 24px;
+  box-shadow: var(--md-shadow);
+}
+
+#sources:not(:empty) {
+  margin-top: 16px;
+  background: var(--md-surface-1);
+  border-radius: 16px;
+  padding: 16px 24px 20px;
+  box-shadow: var(--md-shadow);
+}
+#sources .chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+#sources .chips li {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  flex: 1 1 0;
+  background: var(--md-primary-container);
+  color: var(--md-primary-dark);
+  padding: 8px 16px;
+  border-radius: 12px;
+  min-width: 96px;
+}
+#sources .chips .src-lesson {
+  font-size: 13px;
+  font-weight: 500;
+}
+#sources .chips .src-time {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--md-primary-dark);
+  opacity: 0.75;
+  margin-top: 2px;
+}

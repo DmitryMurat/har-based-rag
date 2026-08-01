@@ -29,6 +29,7 @@ import chromadb  # noqa: E402
 from fastembed import TextEmbedding  # noqa: E402
 
 STATIC_HTML = Path(__file__).resolve().parent / "web.html"
+STATIC_CSS = Path(__file__).resolve().parent / "styles.css"
 HEARTBEAT_TIMEOUT = 15.0  # секунд без пинга от страницы — считаем, что вкладку закрыли
 
 _last_ping = time.time()
@@ -73,7 +74,6 @@ def watchdog(httpd: ThreadingHTTPServer) -> None:
 class Handler(BaseHTTPRequestHandler):
     collection = None
     embedder = None
-    model = "qwen2.5:7b"
     top_k = 5
 
     def log_message(self, fmt, *args) -> None:
@@ -93,6 +93,13 @@ class Handler(BaseHTTPRequestHandler):
             body = STATIC_HTML.read_text(encoding="utf-8").encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/styles.css":
+            body = STATIC_CSS.read_text(encoding="utf-8").encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/css; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -120,7 +127,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not hits:
                     self._send_json(200, {"answer": "В индексе ничего не найдено.", "sources": []})
                     return
-                answer = ask.call_ollama(self.model, question, hits)
+                answer = ask.call_ollama(ask.DEFAULT_MODEL, question, hits)
                 sources = [
                     {"item_name": h["meta"]["item_name"], "start": int(h["meta"]["start"]), "end": int(h["meta"]["end"])}
                     for h in hits
@@ -145,7 +152,6 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--chroma-dir", type=Path, default=ask.PROJECT_ROOT / "chroma")
     ap.add_argument("--collection", default="items")
-    ap.add_argument("--model", default="qwen2.5:7b")
     ap.add_argument("--top-k", type=int, default=5)
     args = ap.parse_args()
 
@@ -160,7 +166,6 @@ def main() -> None:
 
     Handler.collection = collection
     Handler.embedder = embedder
-    Handler.model = args.model
     Handler.top_k = args.top_k
 
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)

@@ -25,12 +25,31 @@ warnings.filterwarnings("ignore", message="The model .* now uses mean pooling")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EMBED_MODEL = "intfloat/multilingual-e5-large"
 OLLAMA_URL = "http://localhost:11434/api/chat"
+DEFAULT_MODEL = "qwen2.5:7b"
 
 SYSTEM_PROMPT = (
     "Ты помощник, который отвечает на вопросы строго на основе предоставленных "
     "фрагментов транскриптов. Если ответа в фрагментах нет — так и скажи, "
-    "не придумывай. Отвечай на русском языке, кратко и по делу."
+    "не придумывай. Отвечай кратко и по делу.\n\n"
+    "ВАЖНО: отвечай ИСКЛЮЧИТЕЛЬНО на русском языке. Никогда не используй "
+    "китайский, английский или любой другой язык — даже если вопрос или "
+    "фрагменты транскриптов написаны не на русском."
 )
+
+# Диапазоны Unicode для CJK-символов — используются, чтобы поймать случаи,
+# когда модель всё же соскальзывает на китайский, и переспросить.
+_CJK_RANGES = (
+    (0x4E00, 0x9FFF), (0x3400, 0x4DBF), (0xF900, 0xFAFF),
+)
+
+
+def _contains_cjk(text: str) -> bool:
+    return any(any(lo <= ord(ch) <= hi for lo, hi in _CJK_RANGES) for ch in text)
+
+
+def format_timestamp(seconds: int) -> str:
+    minutes, secs = divmod(int(seconds), 60)
+    return f"{minutes}:{secs:02d}"
 
 
 def retrieve(collection, embedder, question: str, top_k: int):
@@ -54,17 +73,30 @@ def build_prompt(question: str, hits: list[dict]) -> str:
 
 
 def call_ollama(model: str, question: str, hits: list[dict]) -> str:
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_prompt(question, hits)},
-        ],
-        "stream": False,
-    }
-    resp = requests.post(OLLAMA_URL, json=payload, timeout=300)
-    resp.raise_for_status()
-    return resp.json()["message"]["content"]
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": build_prompt(question, hits)},
+    ]
+    options = {"temperature": 0.2}
+
+    for attempt in range(3):
+        resp = requests.post(
+            OLLAMA_URL,
+            json={"model": model, "messages": messages, "stream": False, "options": options},
+            timeout=300,
+        )
+        resp.raise_for_status()
+        answer = resp.json()["message"]["content"]
+        if not _contains_cjk(answer):
+            return answer
+        messages.append({"role": "assistant", "content": answer})
+        messages.append({
+            "role": "user",
+            "content": "Ты ответил не на русском языке (обнаружены китайские символы). "
+                       "Повтори тот же ответ, но строго на русском языке.",
+        })
+
+    return answer
 
 
 def answer_one(collection, embedder, model: str, question: str, top_k: int) -> None:
@@ -77,7 +109,7 @@ def answer_one(collection, embedder, model: str, question: str, top_k: int) -> N
     print("Источники:")
     for h in hits:
         m = h["meta"]
-        print(f"  - {m['item_name']} [{int(m['start'])}-{int(m['end'])} сек]")
+        print(f"  - {m['item_name']} [{format_timestamp(m['start'])} - {format_timestamp(m['end'])}]")
 
 
 def main() -> None:
@@ -85,7 +117,7 @@ def main() -> None:
     ap.add_argument("question", nargs="?", help="Вопрос. Если не задан — интерактивный режим.")
     ap.add_argument("--chroma-dir", type=Path, default=PROJECT_ROOT / "chroma")
     ap.add_argument("--collection", default="items")
-    ap.add_argument("--model", default="qwen2.5:7b")
+    ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--top-k", type=int, default=5)
     args = ap.parse_args()
 
