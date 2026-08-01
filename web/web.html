@@ -161,6 +161,28 @@ function setStatus(text) {
 
 let isLoading = false;
 
+function renderSuggestions(questions) {
+  if (!questions || !questions.length) return;
+  const rows = questions
+    .map(q => `<li><span class="suggestion-text">${escapeHtml(q)}</span>` +
+      `<button type="button" class="suggestion-ask" data-question="${escapeHtml(q)}">Узнать</button></li>`)
+    .join("");
+  suggestionsEl.innerHTML = '<ul class="suggestion-list">' + rows + "</ul>";
+}
+
+function renderSources(sources) {
+  if (!sources || !sources.length) return;
+  const items = sources
+    .map(s => `<li data-item="${escapeHtml(s.item_name)}" data-start="${s.start}" data-end="${s.end}">` +
+      PLAY_ICON_HTML +
+      `<span class="src-info">` +
+      `<span class="src-lesson">${escapeHtml(s.item_name)}</span>` +
+      `<span class="src-time">${formatTimestamp(s.start)} - ${formatTimestamp(s.end)}</span>` +
+      `</span></li>`)
+    .join("");
+  sourcesEl.innerHTML = '<ul class="chips">' + items + "</ul>";
+}
+
 async function ask() {
   if (isLoading) return;
 
@@ -182,33 +204,55 @@ async function ask() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ question }),
     });
-    const data = await res.json();
 
     if (!res.ok) {
+      let data = {};
+      try { data = await res.json(); } catch (_) { /* тело не JSON */ }
       setStatus("Ошибка: " + (data.error || res.status));
       return;
     }
 
-    renderAnswer(data.answer);
-
-    if (data.suggested_questions && data.suggested_questions.length) {
-      const rows = data.suggested_questions
-        .map(q => `<li><span class="suggestion-text">${escapeHtml(q)}</span>` +
-          `<button type="button" class="suggestion-ask" data-question="${escapeHtml(q)}">Узнать</button></li>`)
-        .join("");
-      suggestionsEl.innerHTML = '<ul class="suggestion-list">' + rows + "</ul>";
+    const contentType = res.headers.get("Content-Type") || "";
+    if (!contentType.includes("x-ndjson")) {
+      // Синхронный JSON-ответ — вопрос отсеян ещё до обращения к LLM (эвристика по
+      // расстоянию), стримить в этом случае нечего.
+      const data = await res.json();
+      renderAnswer(data.answer);
+      renderSuggestions(data.suggested_questions);
+      renderSources(data.sources);
+      return;
     }
 
-    if (data.sources && data.sources.length) {
-      const items = data.sources
-        .map(s => `<li data-item="${escapeHtml(s.item_name)}" data-start="${s.start}" data-end="${s.end}">` +
-          PLAY_ICON_HTML +
-          `<span class="src-info">` +
-          `<span class="src-lesson">${escapeHtml(s.item_name)}</span>` +
-          `<span class="src-time">${formatTimestamp(s.start)} - ${formatTimestamp(s.end)}</span>` +
-          `</span></li>`)
-        .join("");
-      sourcesEl.innerHTML = '<ul class="chips">' + items + "</ul>";
+    // Потоковый ответ: по одной JSON-строке на событие.
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let answerText = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+
+      let newlineAt;
+      while ((newlineAt = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, newlineAt);
+        buf = buf.slice(newlineAt + 1);
+        if (!line) continue;
+
+        const event = JSON.parse(line);
+        if (event.type === "chunk") {
+          answerText += event.text;
+          renderAnswer(answerText);
+        } else if (event.type === "no_match") {
+          renderAnswer(event.answer);
+          renderSuggestions(event.suggested_questions);
+        } else if (event.type === "done") {
+          renderSources(event.sources);
+        } else if (event.type === "error") {
+          setStatus(event.error);
+        }
+      }
     }
   } catch (e) {
     setStatus("Ошибка соединения с сервером: " + e);

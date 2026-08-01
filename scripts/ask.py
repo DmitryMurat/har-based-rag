@@ -12,6 +12,7 @@ Ollama-модель. Никаких обращений к Claude или друг
 Требуется запущенный `ollama serve` (или `brew services start ollama`).
 """
 import argparse
+import json
 import re
 import sys
 import warnings
@@ -60,7 +61,7 @@ SYSTEM_PROMPT = (
 
 
 def is_no_answer(answer: str) -> bool:
-    return answer.strip().strip(".!\"'«»") == NO_ANSWER_SENTINEL
+    return answer.strip().strip(".!:;,-—\"'«»") == NO_ANSWER_SENTINEL
 
 
 SUGGEST_QUESTIONS_COUNT = 3
@@ -150,6 +151,35 @@ def call_ollama(model: str, question: str, hits: list[dict]) -> str:
         })
 
     return answer
+
+
+def call_ollama_stream(model: str, question: str, hits: list[dict]):
+    """Как call_ollama, но возвращает генератор кусков текста по мере генерации —
+    используется веб-интерфейсом, чтобы показывать ответ сразу, не дожидаясь его
+    целиком. В отличие от call_ollama, НЕ делает ретрай при обнаружении CJK-символов:
+    часть ответа к этому моменту уже могла уйти клиенту, и переиграть её задним
+    числом нельзя. Это осознанный компромисс ради ощутимого выигрыша в скорости —
+    системный промпт и низкая temperature уже сильно снижают шанс такого срыва."""
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": build_prompt(question, hits)},
+    ]
+    resp = requests.post(
+        OLLAMA_URL,
+        json={"model": model, "messages": messages, "stream": True, "options": {"temperature": 0.2}},
+        timeout=300,
+        stream=True,
+    )
+    resp.raise_for_status()
+    for line in resp.iter_lines():
+        if not line:
+            continue
+        data = json.loads(line)
+        piece = data.get("message", {}).get("content", "")
+        if piece:
+            yield piece
+        if data.get("done"):
+            break
 
 
 def suggest_questions(model: str, hits: list[dict], count: int = SUGGEST_QUESTIONS_COUNT) -> list[str]:

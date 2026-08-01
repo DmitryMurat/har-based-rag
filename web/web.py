@@ -74,6 +74,11 @@ def watchdog(httpd: ThreadingHTTPServer) -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
+    # Нужен HTTP/1.1 для Transfer-Encoding: chunked (потоковый /ask). Остальные ответы
+    # шлют Connection: close, так что модель "один запрос — одно соединение" не меняется,
+    # просто теперь это explicit, а не следствие HTTP/1.0 по умолчанию.
+    protocol_version = "HTTP/1.1"
+
     collection = None
     embedder = None
     top_k = 5
@@ -87,8 +92,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_empty(self, status: int) -> None:
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
 
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
@@ -99,6 +111,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         elif parsed.path == "/styles.css":
@@ -106,6 +119,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/css; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         elif parsed.path == "/audio":
@@ -120,8 +134,7 @@ class Handler(BaseHTTPRequestHandler):
             touch()
             self._send_json(200, {"ok": True})
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._send_empty(404)
 
     def _serve_audio(self, qs: dict) -> None:
         item = (qs.get("item") or [""])[0]
@@ -153,8 +166,63 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "audio/wav")
         self.send_header("Content-Length", str(len(audio_bytes)))
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(audio_bytes)
+
+    def _emit_event(self, payload: dict) -> None:
+        """Пишет один построчный JSON-эвент в тело chunked-ответа. Формат — по одной
+        JSON-строке на событие (\\n-разделитель), а не SSE ("data: ..."), потому что
+        клиент и так уже читает /ask через обычный POST + fetch(), не через EventSource."""
+        body = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        self.wfile.write(f"{len(body):x}\r\n".encode("ascii") + body + b"\r\n")
+
+    def _stream_ask(self, question: str, hits: list[dict]) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        # Модель может решить, что ответа на вопрос нет, только после того как увидит все
+        # фрагменты — это выражается фиксированным маркером NO_ANSWER (см. ask.py), а не
+        # обычным текстом. Раз токены уходят клиенту по мере генерации, узнать заранее,
+        # каким будет ответ, нельзя — поэтому первые несколько символов придерживаем в
+        # буфере, чтобы отличить короткий маркер от начала настоящего ответа, и только
+        # после этого либо стримим их как обычный текст, либо тихо заменяем на сообщение
+        # "не нашлось" с подсказками, не показав пользователю сам маркер.
+        threshold = len(ask.NO_ANSWER_SENTINEL) + 10
+        buffer = ""
+        flushed = False
+        try:
+            for piece in ask.call_ollama_stream(ask.DEFAULT_MODEL, question, hits):
+                buffer += piece
+                if flushed:
+                    self._emit_event({"type": "chunk", "text": piece})
+                elif len(buffer) >= threshold:
+                    flushed = True
+                    self._emit_event({"type": "chunk", "text": buffer})
+
+            if not flushed:
+                if ask.is_no_answer(buffer):
+                    suggested = ask.suggest_questions(ask.DEFAULT_MODEL, hits)
+                    self._emit_event({
+                        "type": "no_match",
+                        "answer": ask.NO_MATCH_MESSAGE,
+                        "suggested_questions": suggested,
+                    })
+                    return  # финальный chunked-терминатор шлёт finally ниже
+                self._emit_event({"type": "chunk", "text": buffer})
+
+            sources = [
+                {"item_name": h["meta"]["item_name"], "start": int(h["meta"]["start"]), "end": int(h["meta"]["end"])}
+                for h in hits
+            ]
+            self._emit_event({"type": "done", "sources": sources})
+        except Exception as e:
+            self._emit_event({"type": "error", "error": str(e)})
+        finally:
+            self.wfile.write(b"0\r\n\r\n")
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", 0))
@@ -174,16 +242,7 @@ class Handler(BaseHTTPRequestHandler):
                     suggested = ask.suggest_questions(ask.DEFAULT_MODEL, hits)
                     self._send_json(200, {"answer": ask.NO_MATCH_MESSAGE, "sources": [], "suggested_questions": suggested})
                     return
-                answer = ask.call_ollama(ask.DEFAULT_MODEL, question, hits)
-                if ask.is_no_answer(answer):
-                    suggested = ask.suggest_questions(ask.DEFAULT_MODEL, hits)
-                    self._send_json(200, {"answer": ask.NO_MATCH_MESSAGE, "sources": [], "suggested_questions": suggested})
-                    return
-                sources = [
-                    {"item_name": h["meta"]["item_name"], "start": int(h["meta"]["start"]), "end": int(h["meta"]["end"])}
-                    for h in hits
-                ]
-                self._send_json(200, {"answer": answer, "sources": sources})
+                self._stream_ask(question, hits)
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
             finally:
@@ -194,8 +253,7 @@ class Handler(BaseHTTPRequestHandler):
             _shutdown_event.set()
             threading.Thread(target=self.server.shutdown, daemon=True).start()
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._send_empty(404)
 
 
 def main() -> None:
