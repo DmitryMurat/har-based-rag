@@ -69,6 +69,11 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
+function renderAnswer(text) {
+  const escaped = escapeHtml(text);
+  answerEl.innerHTML = escaped.replace(/\*\*([\s\S]+?)\*\*/g, "<strong>$1</strong>");
+}
+
 const PLAY_ICON_HTML = `<span class="play-icon">
   <svg class="icon-play" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M7 5v14l12-7z"/></svg>
   <svg class="icon-stop" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><rect x="6" y="6" width="12" height="12"/></svg>
@@ -173,7 +178,7 @@ async function ask() {
       return;
     }
 
-    answerEl.textContent = data.answer;
+    renderAnswer(data.answer);
 
     if (data.sources && data.sources.length) {
       const items = data.sources
