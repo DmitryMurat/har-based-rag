@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Двойной клик в Finder запускает этот файл в Terminal — поднимает веб-интерфейс
 # RAG и открывает страницу в браузере. Закрытие вкладки останавливает сервер.
+# Вывод дублируется в web/server.log (тот же файл, что и у RunWeb.app) —
+# удобно, если нужно свериться с логом позже.
 cd "$(dirname "$0")/.."
-./venv/bin/python web/web.py
+./venv/bin/python -u web/web.py 2>&1 | tee web/server.log

@@ -1,0 +1,6 @@
+#!/bin/bash
+# Двойной клик в Finder запускает RAG-сервер полностью в фоне, без окна Terminal
+# (у .app-бандлов, в отличие от .command, его в принципе не бывает). Вывод и
+# ошибки пишутся в web/server.log — свериться с ним, если что-то не открылось.
+cd "$(dirname "$0")/../../../.."
+nohup ./venv/bin/python -u web/web.py > web/server.log 2>&1 &
