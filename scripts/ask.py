@@ -17,6 +17,7 @@ import warnings
 from pathlib import Path
 
 import chromadb
+import numpy as np
 import requests
 from fastembed import TextEmbedding
 
@@ -27,14 +28,38 @@ EMBED_MODEL = "intfloat/multilingual-e5-large"
 OLLAMA_URL = "http://localhost:11434/api/chat"
 DEFAULT_MODEL = "qwen2.5:7b"
 
+# Порог косинусного расстояния (1 - cos_sim) до ближайшего фрагмента, начиная с которого
+# считаем, что в индексе нет ничего релевантного вопросу — без реального совпадения ChromaDB
+# всё равно вернёт "наименее плохие" top_k результаты, и без этой проверки модель получила бы
+# на вход не относящийся к делу контекст. Откалибровано вручную на реальном индексе: вопросы
+# не по теме видеоуроков дают cos_sim ~0.75-0.78, реальные совпадения — ~0.82-0.86.
+NO_MATCH_DISTANCE_THRESHOLD = 0.22
+NO_MATCH_MESSAGE = "В загруженных видеоуроках не нашлось подходящего ответа на этот вопрос."
+
+# Фрагменты могут пройти порог по косинусному расстоянию (топически близки к вопросу), но не
+# содержать конкретного факта, который спрашивают. В этом случае решение "нет ответа" принимает
+# сама модель по смыслу, а не эвристика по расстоянию — и код должен уметь это распознать
+# детерминированно, а не парсить произвольный текст отказа. Поэтому просим модель вместо
+# пространного "не знаю" вернуть фиксированный маркер, который однозначно ловится кодом.
+NO_ANSWER_SENTINEL = "NO_ANSWER"
+
 SYSTEM_PROMPT = (
     "Ты помощник, который отвечает на вопросы строго на основе предоставленных "
-    "фрагментов транскриптов. Если ответа в фрагментах нет — так и скажи, "
-    "не придумывай. Отвечай кратко и по делу.\n\n"
-    "ВАЖНО: отвечай ИСКЛЮЧИТЕЛЬНО на русском языке. Никогда не используй "
-    "китайский, английский или любой другой язык — даже если вопрос или "
+    "фрагментов транскриптов. Отвечай кратко и по делу.\n\n"
+    "ВАЖНО — честность важнее полноты ответа: если фрагменты не содержат ответа на "
+    "вопрос или лишь косвенно связаны с ним, не подменяй вопрос похожим по теме, не "
+    f"обобщай не по делу и не выдумывай факты. Вместо этого ответь ровно одним словом: "
+    f"{NO_ANSWER_SENTINEL} — без кавычек, пояснений и знаков препинания, больше ничего "
+    "в ответе быть не должно. Это единственное исключение из требования отвечать на "
+    "русском языке ниже.\n\n"
+    "Во всех остальных случаях отвечай ИСКЛЮЧИТЕЛЬНО на русском языке. Никогда не "
+    "используй китайский, английский или любой другой язык — даже если вопрос или "
     "фрагменты транскриптов написаны не на русском."
 )
+
+
+def is_no_answer(answer: str) -> bool:
+    return answer.strip().strip(".!\"'«»") == NO_ANSWER_SENTINEL
 
 # Диапазоны Unicode для CJK-символов — используются, чтобы поймать случаи,
 # когда модель всё же соскальзывает на китайский, и переспросить.
@@ -53,12 +78,22 @@ def format_timestamp(seconds: int) -> str:
 
 
 def retrieve(collection, embedder, question: str, top_k: int):
-    query_emb = list(embedder.embed([f"query: {question}"]))[0].tolist()
-    result = collection.query(query_embeddings=[query_emb], n_results=top_k)
+    query_emb = np.array(list(embedder.embed([f"query: {question}"]))[0])
+    result = collection.query(
+        query_embeddings=[query_emb.tolist()], n_results=top_k, include=["documents", "metadatas", "embeddings"],
+    )
+    query_norm = query_emb / np.linalg.norm(query_emb)
     hits = []
-    for doc, meta, dist in zip(result["documents"][0], result["metadatas"][0], result["distances"][0]):
-        hits.append({"text": doc, "meta": meta, "distance": dist})
+    for doc, meta, emb in zip(result["documents"][0], result["metadatas"][0], result["embeddings"][0]):
+        emb = np.array(emb)
+        cos_sim = float(np.dot(query_norm, emb / np.linalg.norm(emb)))
+        hits.append({"text": doc, "meta": meta, "cosine_distance": 1 - cos_sim})
+    hits.sort(key=lambda h: h["cosine_distance"])
     return hits
+
+
+def has_relevant_match(hits: list[dict], threshold: float = NO_MATCH_DISTANCE_THRESHOLD) -> bool:
+    return bool(hits) and hits[0]["cosine_distance"] <= threshold
 
 
 def build_prompt(question: str, hits: list[dict]) -> str:
@@ -101,10 +136,13 @@ def call_ollama(model: str, question: str, hits: list[dict]) -> str:
 
 def answer_one(collection, embedder, model: str, question: str, top_k: int) -> None:
     hits = retrieve(collection, embedder, question, top_k)
-    if not hits:
-        print("В индексе ничего не найдено.")
+    if not has_relevant_match(hits):
+        print(NO_MATCH_MESSAGE)
         return
     answer = call_ollama(model, question, hits)
+    if is_no_answer(answer):
+        print(f"\n{NO_MATCH_MESSAGE}\n")
+        return
     print(f"\n{answer}\n")
     print("Источники:")
     for h in hits:

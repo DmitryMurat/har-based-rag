@@ -170,10 +170,13 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(400, {"error": "Пустой вопрос"})
                     return
                 hits = ask.retrieve(self.collection, self.embedder, question, self.top_k)
-                if not hits:
-                    self._send_json(200, {"answer": "В индексе ничего не найдено.", "sources": []})
+                if not ask.has_relevant_match(hits):
+                    self._send_json(200, {"answer": ask.NO_MATCH_MESSAGE, "sources": []})
                     return
                 answer = ask.call_ollama(ask.DEFAULT_MODEL, question, hits)
+                if ask.is_no_answer(answer):
+                    self._send_json(200, {"answer": ask.NO_MATCH_MESSAGE, "sources": []})
+                    return
                 sources = [
                     {"item_name": h["meta"]["item_name"], "start": int(h["meta"]["start"]), "end": int(h["meta"]["end"])}
                     for h in hits
