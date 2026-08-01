@@ -35,7 +35,7 @@ def extract_audio(har_paths: list[Path], start: float | None = None, end: float 
     (в отличие от process_har.prepare_audio, который готовит mono/16kHz для Whisper)."""
     ts_bytes = build_ts_bytes(har_paths)
 
-    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", "pipe:0"]
+    cmd = [process_har.find_executable("ffmpeg"), "-y", "-loglevel", "error", "-i", "pipe:0"]
     if start is not None:
         cmd += ["-ss", str(max(start, 0))]
     if end is not None:
@@ -50,7 +50,7 @@ def extract_audio(har_paths: list[Path], start: float | None = None, end: float 
 
 def play(har_paths: list[Path], start: float | None, end: float | None) -> None:
     ts_bytes = build_ts_bytes(har_paths)
-    cmd = ["ffplay", "-autoexit", "-nodisp", "-loglevel", "error", "-i", "pipe:0"]
+    cmd = [process_har.find_executable("ffplay"), "-autoexit", "-nodisp", "-loglevel", "error", "-i", "pipe:0"]
     if start is not None:
         cmd += ["-ss", str(max(start, 0))]
     if end is not None:

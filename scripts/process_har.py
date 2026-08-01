@@ -25,6 +25,7 @@ import argparse
 import base64
 import json
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -188,7 +189,29 @@ def check_gaps(chunks: dict[int, bytes], missing_body: list[int], log, patched: 
         )
 
 
+# Приложения, запущенные двойным кликом (web/run_web.app, web/run_web.bat), не наследуют PATH
+# из профиля shell (.zshrc и т.п.) — там, где обычно прописан Homebrew на macOS. Из терминала
+# ffmpeg находится, а из GUI-запуска нет: subprocess.run(["ffmpeg", ...]) падает с
+# "[Errno 2] No such file or directory". Поэтому ищем бинарник и в стандартных местах установки.
+_EXECUTABLE_SEARCH_DIRS = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+
+
+def find_executable(name: str) -> str:
+    found = shutil.which(name)
+    if found:
+        return found
+    for d in _EXECUTABLE_SEARCH_DIRS:
+        candidate = Path(d) / name
+        if candidate.exists():
+            return str(candidate)
+    raise RuntimeError(
+        f"Не найден исполняемый файл '{name}'. Установите ffmpeg (например, `brew install ffmpeg` "
+        "на macOS) и убедитесь, что он доступен в PATH."
+    )
+
+
 def run(cmd: list[str]) -> None:
+    cmd = [find_executable(cmd[0]), *cmd[1:]]
     subprocess.run(cmd, check=True)
 
 
