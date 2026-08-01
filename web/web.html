@@ -43,6 +43,7 @@
   </div>
   <div id="status"><span id="status-text"></span></div>
   <div id="answer"></div>
+  <div id="suggestions"></div>
   <div id="sources"></div>
   <audio id="audio-player" preload="none"></audio>
 
@@ -53,6 +54,7 @@ const askButton = document.getElementById("ask");
 const statusEl = document.getElementById("status");
 const statusTextEl = document.getElementById("status-text");
 const answerEl = document.getElementById("answer");
+const suggestionsEl = document.getElementById("suggestions");
 const sourcesEl = document.getElementById("sources");
 const audioPlayer = document.getElementById("audio-player");
 
@@ -139,6 +141,13 @@ sourcesEl.addEventListener("click", (e) => {
   if (li) playSource(li);
 });
 
+suggestionsEl.addEventListener("click", (e) => {
+  const btn = e.target.closest(".suggestion-ask");
+  if (!btn || isLoading) return;
+  questionInput.value = btn.dataset.question;
+  ask();
+});
+
 function setStatus(text) {
   if (!text) {
     statusEl.classList.remove("visible");
@@ -163,6 +172,7 @@ async function ask() {
   questionInput.readOnly = true;
   setStatus("");
   answerEl.textContent = "";
+  suggestionsEl.innerHTML = "";
   sourcesEl.innerHTML = "";
 
   try {
@@ -179,6 +189,14 @@ async function ask() {
     }
 
     renderAnswer(data.answer);
+
+    if (data.suggested_questions && data.suggested_questions.length) {
+      const rows = data.suggested_questions
+        .map(q => `<li><span class="suggestion-text">${escapeHtml(q)}</span>` +
+          `<button type="button" class="suggestion-ask" data-question="${escapeHtml(q)}">Узнать</button></li>`)
+        .join("");
+      suggestionsEl.innerHTML = '<ul class="suggestion-list">' + rows + "</ul>";
+    }
 
     if (data.sources && data.sources.length) {
       const items = data.sources

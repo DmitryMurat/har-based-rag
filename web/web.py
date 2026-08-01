@@ -171,11 +171,13 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 hits = ask.retrieve(self.collection, self.embedder, question, self.top_k)
                 if not ask.has_relevant_match(hits):
-                    self._send_json(200, {"answer": ask.NO_MATCH_MESSAGE, "sources": []})
+                    suggested = ask.suggest_questions(ask.DEFAULT_MODEL, hits)
+                    self._send_json(200, {"answer": ask.NO_MATCH_MESSAGE, "sources": [], "suggested_questions": suggested})
                     return
                 answer = ask.call_ollama(ask.DEFAULT_MODEL, question, hits)
                 if ask.is_no_answer(answer):
-                    self._send_json(200, {"answer": ask.NO_MATCH_MESSAGE, "sources": []})
+                    suggested = ask.suggest_questions(ask.DEFAULT_MODEL, hits)
+                    self._send_json(200, {"answer": ask.NO_MATCH_MESSAGE, "sources": [], "suggested_questions": suggested})
                     return
                 sources = [
                     {"item_name": h["meta"]["item_name"], "start": int(h["meta"]["start"]), "end": int(h["meta"]["end"])}
