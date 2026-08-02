@@ -83,6 +83,10 @@ class Handler(BaseHTTPRequestHandler):
     embedder = None
     top_k = 5
     archive_dir: Path = None
+    # Эмбеддинг-модель грузится в фоне уже после того, как сервер начал слушать порт
+    # (см. main()) — чтобы страница открывалась сразу, а не через несколько секунд
+    # молчания. Пока флаг не установлен, self.embedder ещё None.
+    ready = threading.Event()
 
     def log_message(self, fmt, *args) -> None:
         pass  # тише в консоли — не логируем каждый heartbeat
@@ -133,6 +137,8 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/ping":
             touch()
             self._send_json(200, {"ok": True})
+        elif parsed.path == "/status":
+            self._send_json(200, {"ready": self.ready.is_set()})
         else:
             self._send_empty(404)
 
@@ -230,6 +236,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/ask":
             touch()
+            if not self.ready.is_set():
+                self._send_json(503, {"error": "Модель ещё загружается, попробуйте через пару секунд"})
+                return
             request_started()
             try:
                 data = json.loads(raw)
@@ -266,22 +275,33 @@ def main() -> None:
     ap.add_argument("--top-k", type=int, default=5)
     args = ap.parse_args()
 
+    # Индекс проверяем сразу — это быстро, и если его нет, лучше упасть здесь, до
+    # открытия вкладки в браузере, чем показать пользователю рабочий на вид интерфейс,
+    # который не сможет ответить ни на один вопрос.
     client = chromadb.PersistentClient(path=str(args.chroma_dir))
     try:
         collection = client.get_collection(args.collection)
     except Exception:
         raise SystemExit(f"Индекс не найден в {args.chroma_dir}. Сначала запустите scripts/build_index.py")
 
-    print("Загружаю модель эмбеддингов...")
-    embedder = TextEmbedding(model_name=ask.EMBED_MODEL)
-
     Handler.collection = collection
-    Handler.embedder = embedder
     Handler.top_k = args.top_k
     Handler.archive_dir = args.archive_dir
 
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     threading.Thread(target=watchdog, args=(httpd,), daemon=True).start()
+
+    # А вот загрузка эмбеддинг-модели занимает несколько секунд — её откладываем в
+    # фоновый поток и запускаем сервер + открываем браузер немедленно. Страница (статика,
+    # без зависимости от embedder) отрисуется сразу; поле вопроса до готовности модели
+    # блокирует сам фронтенд, опрашивая /status.
+    def load_embedder() -> None:
+        print("Загружаю модель эмбеддингов...")
+        Handler.embedder = TextEmbedding(model_name=ask.EMBED_MODEL)
+        Handler.ready.set()
+        print("Модель загружена, готов отвечать на вопросы.")
+
+    threading.Thread(target=load_embedder, daemon=True).start()
 
     url = f"http://127.0.0.1:{args.port}/"
     print(f"Сервер запущен: {url}")

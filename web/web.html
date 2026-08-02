@@ -42,7 +42,7 @@
       </button>
     </div>
   </div>
-  <div id="status"><span id="status-text"></span></div>
+  <div id="status"><span class="status-spinner"></span><span id="status-text"></span></div>
   <div id="answer"></div>
   <div id="suggestions"></div>
   <div id="sources"></div>
@@ -149,13 +149,14 @@ suggestionsEl.addEventListener("click", (e) => {
   ask();
 });
 
-function setStatus(text) {
+function setStatus(text, variant = "error") {
   if (!text) {
-    statusEl.classList.remove("visible");
+    statusEl.classList.remove("visible", "info");
     statusTextEl.textContent = "";
     return;
   }
   statusTextEl.textContent = text;
+  statusEl.classList.toggle("info", variant === "info");
   statusEl.classList.add("visible");
 }
 
@@ -183,8 +184,10 @@ function renderSources(sources) {
   sourcesEl.innerHTML = '<ul class="chips">' + items + "</ul>";
 }
 
+let modelReady = false;
+
 async function ask() {
-  if (isLoading) return;
+  if (isLoading || !modelReady) return;
 
   const question = questionInput.value.trim();
   if (!question) return;
@@ -280,6 +283,23 @@ askButton.addEventListener("click", ask);
 questionInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") ask();
 });
+
+// Страница уже видна, но модель эмбеддингов ещё грузится в фоне на сервере (см.
+// web.py) — блокируем поле ввода и опрашиваем /status, пока не станет ready: true.
+questionInput.readOnly = true;
+setStatus("Пожалуйста, подождите, загружается модель эмбеддингов...", "info");
+const statusPoll = setInterval(async () => {
+  try {
+    const res = await fetch("/status");
+    const data = await res.json();
+    if (data.ready) {
+      clearInterval(statusPoll);
+      modelReady = true;
+      questionInput.readOnly = false;
+      setStatus("");
+    }
+  } catch (_) { /* сервер мог ещё не успеть подняться — просто попробуем на следующем тике */ }
+}, 500);
 
 // Heartbeat — пока страница открыта, сервер знает, что он ещё нужен.
 setInterval(() => {

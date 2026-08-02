@@ -193,12 +193,27 @@ h1 {
 
 #status {
   display: none;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
   text-align: center;
   color: var(--md-error);
   font-size: 14px;
   margin-top: 16px;
 }
-#status.visible { display: block; }
+#status.visible { display: flex; }
+#status.info { color: var(--md-on-surface-variant); }
+.status-spinner {
+  display: none;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  border: 2px solid var(--md-outline-variant);
+  border-top-color: var(--md-primary);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+#status.info .status-spinner { display: inline-block; }
 
 #answer {
   margin-top: 20px;
