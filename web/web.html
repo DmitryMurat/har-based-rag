@@ -67,9 +67,16 @@ function formatTimestamp(seconds) {
 }
 
 function escapeHtml(text) {
-  const div = document.createElement("div");
-  div.textContent = text;
-  return div.innerHTML;
+  // Ручное экранирование, а не div.textContent -> div.innerHTML: последнее не трогает
+  // кавычки (они не спецсимволы в текстовом узле), а этот же результат подставляется и
+  // в значения HTML-атрибутов (data-question, data-item и т.п.), где кавычка внутри
+  // текста обрывает атрибут раньше времени и ломает разметку.
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function renderAnswer(text) {
