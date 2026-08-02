@@ -59,6 +59,16 @@ def request_finished() -> None:
         _active_requests -= 1
 
 
+class Server(ThreadingHTTPServer):
+    # По умолчанию socketserver слушает очередь всего в 5 непринятых соединений — легко
+    # выбить при типичной для страницы конкурентности (heartbeat, открытый /ask-стрим,
+    # проигрывание фрагмента, новый вопрос поверх ещё догружающихся follow-up'ов).
+    # Каждый ответ шлёт Connection: close, так что новое TCP-соединение открывается на
+    # каждый запрос — с очередью в 5 браузер получает "TypeError: Failed to fetch" на
+    # соединениях, которые ОС не успела принять. Увеличиваем запас.
+    request_queue_size = 64
+
+
 def watchdog(httpd: ThreadingHTTPServer) -> None:
     while not _shutdown_event.is_set():
         time.sleep(1)
@@ -316,7 +326,7 @@ def main() -> None:
     Handler.top_k = args.top_k
     Handler.archive_dir = args.archive_dir
 
-    httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    httpd = Server(("127.0.0.1", args.port), Handler)
     threading.Thread(target=watchdog, args=(httpd,), daemon=True).start()
 
     # А вот загрузка эмбеддинг-модели занимает несколько секунд — её откладываем в
