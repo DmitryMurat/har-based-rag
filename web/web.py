@@ -225,6 +225,18 @@ class Handler(BaseHTTPRequestHandler):
                 for h in hits
             ]
             self._emit_event({"type": "done", "sources": sources})
+
+            # Необязательное расширение уже показанного ответа — отправляем отдельным
+            # событием после "done", чтобы не задерживать сам ответ и источники. Сбой
+            # здесь (например, Ollama занята) не должен портить уже отданный ответ.
+            try:
+                followups = ask.suggest_followup_questions(
+                    self.collection, self.embedder, ask.DEFAULT_MODEL, question, buffer, hits,
+                )
+                if followups:
+                    self._emit_event({"type": "follow_ups", "questions": followups})
+            except Exception:
+                pass
         except Exception as e:
             self._emit_event({"type": "error", "error": str(e)})
         finally:

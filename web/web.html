@@ -44,8 +44,8 @@
   </div>
   <div id="status"><span class="status-spinner"></span><span id="status-text"></span></div>
   <div id="answer"></div>
-  <div id="suggestions"></div>
   <div id="sources"></div>
+  <div id="suggestions"></div>
   <audio id="audio-player" preload="none"></audio>
 
 <script>
@@ -253,6 +253,8 @@ async function ask() {
           renderSuggestions(event.suggested_questions);
         } else if (event.type === "done") {
           renderSources(event.sources);
+        } else if (event.type === "follow_ups") {
+          renderSuggestions(event.questions);
         } else if (event.type === "error") {
           setStatus(event.error);
         }

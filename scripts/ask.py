@@ -94,19 +94,27 @@ def format_timestamp(seconds: int) -> str:
     return f"{minutes}:{secs:02d}"
 
 
-def retrieve(collection, embedder, question: str, top_k: int):
-    query_emb = np.array(list(embedder.embed([f"query: {question}"]))[0])
+def retrieve(collection, embedder, query_text: str, top_k: int, exclude_ids: set[str] | None = None):
+    """exclude_ids позволяет искать "ещё что-нибудь", не считая уже показанные куски —
+    используется suggest_followup_questions(), чтобы не предлагать вопрос по тому же
+    фрагменту, что уже лёг в основной ответ. При exclude_ids запрашиваем с запасом
+    (top_k + число исключений), иначе после фильтрации может остаться меньше top_k."""
+    query_emb = np.array(list(embedder.embed([f"query: {query_text}"]))[0])
+    n_results = top_k + (len(exclude_ids) if exclude_ids else 0)
     result = collection.query(
-        query_embeddings=[query_emb.tolist()], n_results=top_k, include=["documents", "metadatas", "embeddings"],
+        query_embeddings=[query_emb.tolist()], n_results=n_results,
+        include=["documents", "metadatas", "embeddings"],
     )
     query_norm = query_emb / np.linalg.norm(query_emb)
     hits = []
-    for doc, meta, emb in zip(result["documents"][0], result["metadatas"][0], result["embeddings"][0]):
+    for id_, doc, meta, emb in zip(result["ids"][0], result["documents"][0], result["metadatas"][0], result["embeddings"][0]):
+        if exclude_ids and id_ in exclude_ids:
+            continue
         emb = np.array(emb)
         cos_sim = float(np.dot(query_norm, emb / np.linalg.norm(emb)))
-        hits.append({"text": doc, "meta": meta, "cosine_distance": 1 - cos_sim})
+        hits.append({"id": id_, "text": doc, "meta": meta, "cosine_distance": 1 - cos_sim})
     hits.sort(key=lambda h: h["cosine_distance"])
-    return hits
+    return hits[:top_k]
 
 
 def has_relevant_match(hits: list[dict], threshold: float = NO_MATCH_DISTANCE_THRESHOLD) -> bool:
@@ -184,6 +192,20 @@ def call_ollama_stream(model: str, question: str, hits: list[dict]):
             break
 
 
+def _parse_numbered_questions(content: str, count: int) -> list[str]:
+    questions = []
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^\d+[.)]\s*(.+)$", line)
+        question = m.group(1).strip() if m else line
+        if len(question) > SUGGEST_QUESTION_MAX_CHARS:
+            question = question[:SUGGEST_QUESTION_MAX_CHARS - 1].rstrip() + "…"
+        questions.append(question)
+    return questions[:count]
+
+
 def suggest_questions(model: str, hits: list[dict], count: int = SUGGEST_QUESTIONS_COUNT) -> list[str]:
     """По топ-N ближайших к вопросу фрагментов просит модель сформулировать вопрос,
     на который каждый из них отвечает — используется, когда исходный вопрос
@@ -211,17 +233,58 @@ def suggest_questions(model: str, hits: list[dict], count: int = SUGGEST_QUESTIO
     except Exception:
         return []
 
-    questions = []
-    for line in content.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        m = re.match(r"^\d+[.)]\s*(.+)$", line)
-        question = m.group(1).strip() if m else line
-        if len(question) > SUGGEST_QUESTION_MAX_CHARS:
-            question = question[:SUGGEST_QUESTION_MAX_CHARS - 1].rstrip() + "…"
-        questions.append(question)
-    return questions[:count]
+    return _parse_numbered_questions(content, count)
+
+
+FOLLOWUP_QUESTIONS_COUNT = 3
+FOLLOWUP_SYSTEM_PROMPT = (
+    "Ты помощник, который по уже данному ответу на вопрос по видеоуроку и "
+    "дополнительному фрагменту транскрипта формулирует один вопрос на русском "
+    "языке, расширяющий или уточняющий этот ответ — например, поясняющий "
+    f"использованный термин или добавляющий смежную деталь. Вопрос — не длиннее "
+    f"{SUGGEST_QUESTION_MAX_CHARS} символов, без нумерации, кавычек и пояснений."
+)
+
+
+def suggest_followup_questions(
+    collection, embedder, model: str, question: str, answer: str, used_hits: list[dict],
+    count: int = FOLLOWUP_QUESTIONS_COUNT,
+) -> list[str]:
+    """После УСПЕШНОГО ответа ищет ещё count фрагментов, не использованных в этом
+    ответе (поиском по тексту самого ответа, а не исходного вопроса — так находятся
+    смежные, а не те же самые куски), и просит модель сформулировать по вопросу на
+    каждый — расширяющему уже полученный ответ. В отличие от suggest_questions()
+    (для случая "ничего не нашлось"), тут материал гарантированно есть в индексе,
+    т.к. он реально извлечён поиском, а не придуман моделью."""
+    exclude_ids = {h["id"] for h in used_hits if "id" in h}
+    extra_hits = retrieve(collection, embedder, answer, count, exclude_ids=exclude_ids)
+    if not extra_hits:
+        return []
+
+    fragments = "\n\n".join(f"Фрагмент {i + 1}:\n{h['text']}" for i, h in enumerate(extra_hits))
+    prompt = (
+        f"Вопрос пользователя: {question}\n"
+        f"Уже данный ответ: {answer}\n\n"
+        f"Ниже даны {len(extra_hits)} дополнительных фрагмента(ов) транскриптов "
+        "видеоуроков, не использованных в этом ответе. Для каждого сформулируй "
+        "ровно один вопрос на русском языке, который логично расширяет или "
+        "дополняет уже полученный ответ (например, поясняет термин или добавляет "
+        f"смежную деталь) и на который этот фрагмент содержит прямой ответ. Каждый "
+        f"вопрос — не длиннее {SUGGEST_QUESTION_MAX_CHARS} символов. Верни ровно "
+        f"{len(extra_hits)} строк(и), по одному вопросу на строку, в формате:\n"
+        "1. <вопрос>\n2. <вопрос>\n...\nБез пустых строк и пояснений.\n\n" + fragments
+    )
+
+    try:
+        content = _chat(
+            model,
+            [{"role": "system", "content": FOLLOWUP_SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+            {"temperature": 0.4},
+        )
+    except Exception:
+        return []
+
+    return _parse_numbered_questions(content, count)
 
 
 def build_no_match_message(model: str, hits: list[dict]) -> str:
