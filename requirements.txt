@@ -3,3 +3,5 @@ chromadb
 fastembed
 requests
 tqdm
+starlette
+uvicorn
