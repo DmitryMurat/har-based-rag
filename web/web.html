@@ -151,7 +151,7 @@ sourcesEl.addEventListener("click", (e) => {
 
 suggestionsEl.addEventListener("click", (e) => {
   const btn = e.target.closest(".suggestion-ask");
-  if (!btn || isLoading) return;
+  if (!btn || answerLoading) return;
   questionInput.value = btn.dataset.question;
   ask();
 });
@@ -167,15 +167,23 @@ function setStatus(text, variant = "error") {
   statusEl.classList.add("visible");
 }
 
-let isLoading = false;
+let answerLoading = false;
 
 function renderSuggestions(questions) {
-  if (!questions || !questions.length) return;
+  if (!questions || !questions.length) {
+    suggestionsEl.innerHTML = "";
+    return;
+  }
   const rows = questions
     .map(q => `<li><span class="suggestion-text">${escapeHtml(q)}</span>` +
       `<button type="button" class="suggestion-ask" data-question="${escapeHtml(q)}">Узнать</button></li>`)
     .join("");
   suggestionsEl.innerHTML = '<ul class="suggestion-list">' + rows + "</ul>";
+}
+
+function renderSuggestionsLoading() {
+  suggestionsEl.innerHTML = '<div class="suggestions-loading">' +
+    '<span class="status-spinner"></span><span>Формируется список расширенных вопросов</span></div>';
 }
 
 function renderSources(sources) {
@@ -192,14 +200,26 @@ function renderSources(sources) {
 }
 
 let modelReady = false;
+let activeRequestId = 0;
+let currentAbortController = null;
 
 async function ask() {
-  if (isLoading || !modelReady) return;
+  if (answerLoading || !modelReady) return;
 
   const question = questionInput.value.trim();
   if (!question) return;
 
-  isLoading = true;
+  // Если предыдущий вопрос ещё тянет follow-up-вопросы в фоне (сам ответ уже показан,
+  // поле уже разблокировано — см. ниже) — тихо обрываем его: и клиент перестаёт читать
+  // тот поток, и сервер, наткнувшись на разрыв соединения, сам всё корректно погасит
+  // (см. коммит про BrokenPipeError).
+  if (currentAbortController) currentAbortController.abort();
+  const myRequestId = ++activeRequestId;
+  const abortController = new AbortController();
+  currentAbortController = abortController;
+  const isCurrent = () => myRequestId === activeRequestId;
+
+  answerLoading = true;
   stopPlayback();
   questionInput.setSelectionRange(questionInput.value.length, questionInput.value.length);
   askButton.classList.add("loading");
@@ -209,12 +229,26 @@ async function ask() {
   suggestionsEl.innerHTML = "";
   sourcesEl.innerHTML = "";
 
+  // Основной ответ получен (успешно, "не нашлось" или ошибка) — дальше пользователь
+  // уже может печатать новый вопрос, даже если follow-up-вопросы для этого ответа ещё
+  // грузятся в фоне.
+  function unlockInput() {
+    if (!isCurrent()) return; // запрос уже устарел — не трогаем состояние более нового
+    answerLoading = false;
+    askButton.classList.remove("loading");
+    questionInput.readOnly = false;
+  }
+
+  let followupsPending = false;
+
   try {
     const res = await fetch("/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ question }),
+      signal: abortController.signal,
     });
+    if (!isCurrent()) return;
 
     if (!res.ok) {
       let data = {};
@@ -226,8 +260,9 @@ async function ask() {
     const contentType = res.headers.get("Content-Type") || "";
     if (!contentType.includes("x-ndjson")) {
       // Синхронный JSON-ответ — вопрос отсеян ещё до обращения к LLM (эвристика по
-      // расстоянию), стримить в этом случае нечего.
+      // расстоянию), стримить и ждать follow-up в этом случае нечего.
       const data = await res.json();
+      if (!isCurrent()) return;
       renderAnswer(data.answer);
       renderSuggestions(data.suggested_questions);
       renderSources(data.sources);
@@ -242,14 +277,14 @@ async function ask() {
 
     while (true) {
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done || !isCurrent()) break;
       buf += decoder.decode(value, { stream: true });
 
       let newlineAt;
       while ((newlineAt = buf.indexOf("\n")) !== -1) {
         const line = buf.slice(0, newlineAt);
         buf = buf.slice(newlineAt + 1);
-        if (!line) continue;
+        if (!line || !isCurrent()) continue;
 
         const event = JSON.parse(line);
         if (event.type === "chunk") {
@@ -257,22 +292,36 @@ async function ask() {
           renderAnswer(answerText);
         } else if (event.type === "no_match") {
           renderAnswer(event.answer);
+          unlockInput();
           renderSuggestions(event.suggested_questions);
         } else if (event.type === "done") {
           renderSources(event.sources);
+          unlockInput();
+          if (event.sources && event.sources.length) {
+            renderSuggestionsLoading();
+            followupsPending = true;
+          }
         } else if (event.type === "follow_ups") {
+          followupsPending = false;
           renderSuggestions(event.questions);
         } else if (event.type === "error") {
           setStatus(event.error);
+          unlockInput();
         }
       }
     }
+
+    // Поток закрылся сам, а follow-up так и не пришли (пусто/сбой на сервере) —
+    // спиннер под источниками не должен висеть вечно.
+    if (isCurrent() && followupsPending) {
+      suggestionsEl.innerHTML = "";
+    }
   } catch (e) {
-    setStatus("Ошибка соединения с сервером: " + e);
+    if (e.name === "AbortError") return; // новый вопрос пользователя тихо отменил этот запрос
+    if (isCurrent()) setStatus("Ошибка соединения с сервером: " + e);
   } finally {
-    isLoading = false;
-    askButton.classList.remove("loading");
-    questionInput.readOnly = false;
+    unlockInput();
+    if (currentAbortController === abortController) currentAbortController = null;
   }
 }
 

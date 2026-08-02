@@ -204,7 +204,7 @@ h1 {
 #status.visible { display: flex; }
 #status.info { color: var(--md-on-surface-variant); }
 .status-spinner {
-  display: none;
+  display: inline-block;
   width: 14px;
   height: 14px;
   flex-shrink: 0;
@@ -213,7 +213,9 @@ h1 {
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
-#status.info .status-spinner { display: inline-block; }
+/* В #status спиннер уместен только для нейтральных сообщений (.info), не для ошибок.
+   Вне #status (например, в .suggestions-loading) класс работает сам по себе. */
+#status:not(.info) .status-spinner { display: none; }
 
 #answer {
   margin-top: 20px;
@@ -238,6 +240,15 @@ h1 {
   border-radius: 16px;
   padding: 8px 12px;
   box-shadow: var(--md-shadow);
+}
+.suggestions-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 8px;
+  color: var(--md-on-surface-variant);
+  font-size: 14px;
 }
 .suggestion-list {
   list-style: none;
