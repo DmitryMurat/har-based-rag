@@ -28,13 +28,16 @@ def build_ts_bytes(har_paths: list[Path]) -> bytes:
     return b"".join(chunks[idx] for idx in sorted(chunks))
 
 
-def extract_audio(har_paths: list[Path], start: float | None = None, end: float | None = None) -> bytes:
-    """Декодирует чанки из HAR в памяти и вырезает через ffmpeg нужный отрезок
-    аудио (или весь файл, если start/end не заданы). Возвращает байты WAV —
-    без пересжатия/ресемплинга, чтобы сохранить исходное качество для прослушивания
-    (в отличие от process_har.prepare_audio, который готовит mono/16kHz для Whisper)."""
-    ts_bytes = build_ts_bytes(har_paths)
+def extract_audio_segment(ts_bytes: bytes, start: float | None = None, end: float | None = None) -> bytes:
+    """Вырезает через ffmpeg нужный отрезок аудио (или весь файл, если start/end не
+    заданы) из уже склеенного .ts-потока. Возвращает байты WAV — без пересжатия/
+    ресемплинга, чтобы сохранить исходное качество для прослушивания (в отличие от
+    process_har.prepare_audio, который готовит mono/16kHz для Whisper).
 
+    Отделено от extract_audio(), чтобы вызывающий код мог закешировать результат
+    build_ts_bytes() (самая тяжёлая часть — разбор HAR и base64-декод) между
+    повторными прослушиваниями одного и того же урока, и каждый раз платить только
+    за сам ffmpeg-вырез, который зависит от конкретных start/end."""
     cmd = [process_har.find_executable("ffmpeg"), "-y", "-loglevel", "error", "-i", "pipe:0"]
     if start is not None:
         cmd += ["-ss", str(max(start, 0))]
@@ -46,6 +49,14 @@ def extract_audio(har_paths: list[Path], start: float | None = None, end: float 
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.decode("utf-8", errors="replace"))
     return proc.stdout
+
+
+def extract_audio(har_paths: list[Path], start: float | None = None, end: float | None = None) -> bytes:
+    """Декодирует чанки из HAR в памяти и вырезает нужный отрезок — удобная обёртка
+    вокруг build_ts_bytes() + extract_audio_segment() для разовых вызовов (CLI).
+    Для повторных вызовов на одних и тех же har_paths вызывающему коду выгоднее
+    закешировать build_ts_bytes() самостоятельно (см. web/web.py)."""
+    return extract_audio_segment(build_ts_bytes(har_paths), start, end)
 
 
 def play(har_paths: list[Path], start: float | None, end: float | None) -> None:

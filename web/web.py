@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import webbrowser
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -39,6 +40,33 @@ _ping_lock = threading.Lock()
 _shutdown_event = threading.Event()
 _active_requests = 0
 _active_lock = threading.Lock()
+
+# Склейка чанков урока в единый .ts (play_har.build_ts_bytes) — самая тяжёлая часть
+# проигрывания фрагмента: разбор HAR-файла (сотни МБ JSON) и base64-декод всех чанков.
+# Сама вырезка отрезка через ffmpeg — дёшево и зависит от конкретных start/end, поэтому
+# кешируем только результат склейки, по имени урока. LRU на несколько уроков — записи
+# по 100-300 МБ, без ограничения на "полистать" разные уроки память легко улетит за
+# гигабайты.
+_TS_CACHE_MAX_ITEMS = 4
+_ts_cache: "OrderedDict[str, bytes]" = OrderedDict()
+_ts_cache_lock = threading.Lock()
+
+
+def _get_ts_bytes(cache_key: str, har_paths: list[Path]) -> bytes:
+    with _ts_cache_lock:
+        cached = _ts_cache.get(cache_key)
+        if cached is not None:
+            _ts_cache.move_to_end(cache_key)
+            return cached
+
+    ts_bytes = play_har.build_ts_bytes(har_paths)
+
+    with _ts_cache_lock:
+        _ts_cache[cache_key] = ts_bytes
+        _ts_cache.move_to_end(cache_key)
+        while len(_ts_cache) > _TS_CACHE_MAX_ITEMS:
+            _ts_cache.popitem(last=False)
+    return ts_bytes
 
 
 def touch() -> None:
@@ -184,7 +212,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            audio_bytes = play_har.extract_audio(har_paths, start, end)
+            ts_bytes = _get_ts_bytes(item, har_paths)
+            audio_bytes = play_har.extract_audio_segment(ts_bytes, start, end)
         except Exception as e:
             self._send_json(500, {"error": str(e)})
             return
