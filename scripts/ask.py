@@ -192,18 +192,70 @@ def call_ollama_stream(model: str, question: str, hits: list[dict]):
             break
 
 
-def _parse_numbered_questions(content: str, count: int) -> list[str]:
-    questions = []
+def _parse_numbered_lines(content: str) -> list[str]:
+    """Разбирает пронумерованный список из ответа модели построчно, без проверки длины —
+    саму длину гарантирует _enforce_max_length()."""
+    items = []
     for line in content.splitlines():
         line = line.strip()
         if not line:
             continue
         m = re.match(r"^\d+[.)]\s*(.+)$", line)
-        question = m.group(1).strip() if m else line
-        if len(question) > SUGGEST_QUESTION_MAX_CHARS:
-            question = question[:SUGGEST_QUESTION_MAX_CHARS - 1].rstrip() + "…"
-        questions.append(question)
-    return questions[:count]
+        items.append(m.group(1).strip() if m else line)
+    return items
+
+
+def _trim_to_length(text: str, max_chars: int) -> str:
+    """Детерминированный последний рубеж: обрезает по границе слова (не посреди него),
+    если пробел не слишком далеко от края, иначе — по символам. Результат вместе с "…"
+    гарантированно укладывается в max_chars."""
+    if len(text) <= max_chars:
+        return text
+    truncated = text[: max_chars - 1]
+    last_space = truncated.rfind(" ")
+    if last_space > max_chars * 0.6:
+        truncated = truncated[:last_space]
+    return truncated.rstrip(" ,.;:—-") + "…"
+
+
+def _shorten_question(model: str, question: str, max_chars: int) -> str | None:
+    """Просит модель сократить вопрос по смыслу, а не обрывать его посреди слова, как
+    это делает _trim_to_length(). Возвращает None при сбое сети — вызывающий код в
+    этом случае падает обратно на детерминированную обрезку."""
+    prompt = (
+        f"Сократи следующий вопрос до не более {max_chars} символов, сохранив его смысл "
+        "и вопросительную форму. Верни только сам сокращённый вопрос — без кавычек, "
+        f"нумерации и пояснений.\n\n{question}"
+    )
+    try:
+        content = _chat(
+            model,
+            [{"role": "system", "content": SUGGEST_SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+            {"temperature": 0.2},
+        )
+    except Exception:
+        return None
+    shortened = content.strip().strip("\"'«»")
+    return shortened or None
+
+
+def _enforce_max_length(model: str, question: str, max_chars: int = SUGGEST_QUESTION_MAX_CHARS) -> str:
+    """Гарантирует, что вопрос уложится в max_chars символов: сначала пробует попросить
+    модель сократить его по смыслу, и только если это не удалось (сбой сети или модель
+    всё равно не уложилась) — подрезает по границе слова как детерминированный запасной
+    вариант. В отличие от слепой обрезки по индексу символа, не рвёт вопрос посреди слова
+    в типичном случае."""
+    if len(question) <= max_chars:
+        return question
+    shortened = _shorten_question(model, question, max_chars)
+    if shortened and len(shortened) <= max_chars:
+        return shortened
+    return _trim_to_length(shortened or question, max_chars)
+
+
+def _finalize_questions(model: str, content: str, count: int) -> list[str]:
+    items = _parse_numbered_lines(content)[:count]
+    return [_enforce_max_length(model, q) for q in items]
 
 
 def suggest_questions(model: str, hits: list[dict], count: int = SUGGEST_QUESTIONS_COUNT) -> list[str]:
@@ -233,7 +285,7 @@ def suggest_questions(model: str, hits: list[dict], count: int = SUGGEST_QUESTIO
     except Exception:
         return []
 
-    return _parse_numbered_questions(content, count)
+    return _finalize_questions(model, content, count)
 
 
 FOLLOWUP_QUESTIONS_COUNT = 3
@@ -284,7 +336,7 @@ def suggest_followup_questions(
     except Exception:
         return []
 
-    return _parse_numbered_questions(content, count)
+    return _finalize_questions(model, content, count)
 
 
 def build_no_match_message(model: str, hits: list[dict]) -> str:
