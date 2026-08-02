@@ -238,9 +238,19 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         except Exception as e:
-            self._emit_event({"type": "error", "error": str(e)})
+            # Если вкладку закрыли/оборвали соединение посреди стрима, wfile.write()
+            # выше уже упал с BrokenPipeError — сокет мёртв, и попытка сообщить об этом
+            # клиенту тем же способом упадёт точно так же. Молча проглатываем: сервер не
+            # должен шуметь traceback'ами из-за штатного закрытия вкладки пользователем.
+            try:
+                self._emit_event({"type": "error", "error": str(e)})
+            except Exception:
+                pass
         finally:
-            self.wfile.write(b"0\r\n\r\n")
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+            except Exception:
+                pass
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", 0))
@@ -265,7 +275,13 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self._stream_ask(question, hits)
             except Exception as e:
-                self._send_json(500, {"error": str(e)})
+                # Как и в _stream_ask: если сама ошибка — оборванное клиентом соединение,
+                # эта попытка сообщить о ней тем же способом упадёт так же и не должна
+                # шуметь в логе необработанным traceback'ом.
+                try:
+                    self._send_json(500, {"error": str(e)})
+                except Exception:
+                    pass
             finally:
                 touch()
                 request_finished()
