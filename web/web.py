@@ -164,6 +164,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": f"HAR-файл не найден: {item}.har"})
             return
 
+        # scripts/process.py --patch докрывает недостающие чанки начала записи отдельным
+        # коротким HAR (обычно из-за того, что DevTools вытеснил старые тела запросов из
+        # буфера при экспорте большого файла) и архивирует его рядом под тем же именем с
+        # суффиксом "-start" — см. lesson12-start.har и т.п. Основной файл в этом случае не
+        # содержит чанков начала, поэтому без патча начало записи не проигрывается.
+        har_paths = [har_path]
+        patch_path = self.archive_dir / f"{item}-start.har"
+        if patch_path.exists():
+            har_paths.append(patch_path)
+
         try:
             start_raw = (qs.get("start") or [None])[0]
             end_raw = (qs.get("end") or [None])[0]
@@ -174,7 +184,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            audio_bytes = play_har.extract_audio([har_path], start, end)
+            audio_bytes = play_har.extract_audio(har_paths, start, end)
         except Exception as e:
             self._send_json(500, {"error": str(e)})
             return

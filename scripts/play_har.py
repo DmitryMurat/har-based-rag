@@ -68,7 +68,16 @@ def main() -> None:
     if not args.har_path.exists():
         raise SystemExit(f"Файл не найден: {args.har_path}")
 
-    play([args.har_path], args.start, args.end)
+    # scripts/process.py --patch докрывает недостающие чанки начала записи отдельным
+    # коротким HAR, архивируемым рядом под тем же именем с суффиксом "-start" (см.
+    # lesson12-start.har и т.п.) — без него начало записи не проигрывается.
+    har_paths = [args.har_path]
+    patch_path = args.har_path.with_name(f"{args.har_path.stem}-start.har")
+    if patch_path.exists():
+        print(f"Докрываю недостающие чанки из {patch_path.name}")
+        har_paths.append(patch_path)
+
+    play(har_paths, args.start, args.end)
 
 
 if __name__ == "__main__":
