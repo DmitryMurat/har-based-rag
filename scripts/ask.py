@@ -14,6 +14,7 @@ Ollama-модель. Никаких обращений к Claude или друг
 import argparse
 import json
 import re
+import socket
 import sys
 import warnings
 from pathlib import Path
@@ -142,6 +143,78 @@ def _chat(model: str, messages: list[dict], options: dict) -> str:
     return resp.json()["message"]["content"]
 
 
+def force_close_response(resp: requests.Response) -> None:
+    """Прерывает уже начатое чтение потокового HTTP-ответа из ДРУГОГО потока.
+
+    resp.close() тут не помогает — экспериментально проверено, что он лишь помечает
+    объект закрытым и не будит поток, заблокированный внутри resp.iter_lines() в
+    ожидании первого байта от Ollama (актуально, пока запрос ещё "застрял" в prefill и
+    не начал стримить токены — is_stale() физически некому проверить, пока нет данных).
+    Разбудить блокирующее чтение может только shutdown() сокета на низком уровне —
+    путь к нему завязан на внутренности urllib3, поэтому пробуем аккуратно и тихо
+    отступаем к обычному close(), если не получилось (например, сменилась версия
+    urllib3 и путь атрибутов больше не совпадает)."""
+    sock = None
+    try:
+        fp = getattr(resp.raw, "_fp", None)
+        candidate = getattr(fp, "fp", None) if fp is not None else None
+        raw_sock = getattr(candidate, "raw", None)
+        sock = getattr(raw_sock, "_sock", None) if raw_sock is not None else None
+    except Exception:
+        sock = None
+
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass  # сокет уже закрыт кем-то ещё — и хорошо, цель та же
+
+    try:
+        resp.close()
+    except Exception:
+        pass
+
+
+def _chat_cancellable(model: str, messages: list[dict], options: dict, is_stale=None, on_response=None) -> str | None:
+    """Как _chat(), но запрашивает у Ollama потоковый ответ (даже если сам вызывающий
+    код не показывает его по частям) ради проверочных точек между чанками: если
+    is_stale() вернёт True, соединение закрывается немедленно, не дожидаясь, пока Ollama
+    догенерирует остаток — иначе GPU продолжал бы быть занят ответом, который уже никому
+    не нужен (пользователь успел задать новый вопрос), и следующий, актуальный запрос
+    вставал бы за ним в очередь. Возвращает None, если было прервано.
+
+    on_response(resp), если передан, вызывается сразу после получения ответа — даёт
+    вызывающему коду (см. web.py) шанс запомнить resp и позже прервать его форсированно
+    (force_close_response) из ДРУГОГО потока, если эта генерация устареет раньше, чем
+    успеет прийти хоть один чанк, — is_stale() внутри этого цикла тогда попросту не
+    успевает выполниться ни разу."""
+    resp = requests.post(
+        OLLAMA_URL,
+        json={"model": model, "messages": messages, "stream": True, "options": options},
+        timeout=300,
+        stream=True,
+    )
+    resp.raise_for_status()
+    if on_response is not None:
+        on_response(resp)
+    parts = []
+    try:
+        for line in resp.iter_lines():
+            if is_stale is not None and is_stale():
+                return None
+            if not line:
+                continue
+            data = json.loads(line)
+            piece = data.get("message", {}).get("content", "")
+            if piece:
+                parts.append(piece)
+            if data.get("done"):
+                break
+    finally:
+        resp.close()
+    return "".join(parts)
+
+
 def call_ollama(model: str, question: str, hits: list[dict]) -> str:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -163,13 +236,20 @@ def call_ollama(model: str, question: str, hits: list[dict]) -> str:
     return answer
 
 
-def call_ollama_stream(model: str, question: str, hits: list[dict]):
+def call_ollama_stream(model: str, question: str, hits: list[dict], is_stale=None, on_response=None):
     """Как call_ollama, но возвращает генератор кусков текста по мере генерации —
     используется веб-интерфейсом, чтобы показывать ответ сразу, не дожидаясь его
     целиком. В отличие от call_ollama, НЕ делает ретрай при обнаружении CJK-символов:
     часть ответа к этому моменту уже могла уйти клиенту, и переиграть её задним
     числом нельзя. Это осознанный компромисс ради ощутимого выигрыша в скорости —
-    системный промпт и низкая temperature уже сильно снижают шанс такого срыва."""
+    системный промпт и низкая temperature уже сильно снижают шанс такого срыва.
+
+    is_stale() проверяется между чанками — если пользователь успел задать новый
+    вопрос, соединение с Ollama закрывается немедленно, а не висит до конца генерации:
+    иначе GPU оставался бы занят уже никому не нужным ответом, и следующий, актуальный
+    запрос вставал бы за ним в очередь. on_response(resp) — см. _chat_cancellable: даёт
+    вызывающему коду шанс прервать это соединение форсированно из другого потока, пока
+    is_stale() ещё некому проверить (ни один чанк ещё не пришёл)."""
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": build_prompt(question, hits)},
@@ -181,15 +261,22 @@ def call_ollama_stream(model: str, question: str, hits: list[dict]):
         stream=True,
     )
     resp.raise_for_status()
-    for line in resp.iter_lines():
-        if not line:
-            continue
-        data = json.loads(line)
-        piece = data.get("message", {}).get("content", "")
-        if piece:
-            yield piece
-        if data.get("done"):
-            break
+    if on_response is not None:
+        on_response(resp)
+    try:
+        for line in resp.iter_lines():
+            if is_stale is not None and is_stale():
+                return
+            if not line:
+                continue
+            data = json.loads(line)
+            piece = data.get("message", {}).get("content", "")
+            if piece:
+                yield piece
+            if data.get("done"):
+                break
+    finally:
+        resp.close()
 
 
 def _parse_numbered_lines(content: str) -> list[str]:
@@ -218,50 +305,58 @@ def _trim_to_length(text: str, max_chars: int) -> str:
     return truncated.rstrip(" ,.;:—-") + "…"
 
 
-def _shorten_question(model: str, question: str, max_chars: int) -> str | None:
+def _shorten_question(model: str, question: str, max_chars: int, is_stale=None) -> str | None:
     """Просит модель сократить вопрос по смыслу, а не обрывать его посреди слова, как
-    это делает _trim_to_length(). Возвращает None при сбое сети — вызывающий код в
-    этом случае падает обратно на детерминированную обрезку."""
+    это делает _trim_to_length(). Возвращает None при сбое сети или при отмене — в
+    обоих случаях вызывающий код падает обратно на детерминированную обрезку."""
     prompt = (
         f"Сократи следующий вопрос до не более {max_chars} символов, сохранив его смысл "
         "и вопросительную форму. Верни только сам сокращённый вопрос — без кавычек, "
         f"нумерации и пояснений.\n\n{question}"
     )
     try:
-        content = _chat(
+        content = _chat_cancellable(
             model,
             [{"role": "system", "content": SUGGEST_SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
             {"temperature": 0.2},
+            is_stale=is_stale,
         )
     except Exception:
+        return None
+    if content is None:
         return None
     shortened = content.strip().strip("\"'«»")
     return shortened or None
 
 
-def _enforce_max_length(model: str, question: str, max_chars: int = SUGGEST_QUESTION_MAX_CHARS) -> str:
+def _enforce_max_length(model: str, question: str, max_chars: int = SUGGEST_QUESTION_MAX_CHARS, is_stale=None) -> str:
     """Гарантирует, что вопрос уложится в max_chars символов: сначала пробует попросить
-    модель сократить его по смыслу, и только если это не удалось (сбой сети или модель
-    всё равно не уложилась) — подрезает по границе слова как детерминированный запасной
-    вариант. В отличие от слепой обрезки по индексу символа, не рвёт вопрос посреди слова
-    в типичном случае."""
+    модель сократить его по смыслу, и только если это не удалось (сбой сети, отмена или
+    модель всё равно не уложилась) — подрезает по границе слова как детерминированный
+    запасной вариант. В отличие от слепой обрезки по индексу символа, не рвёт вопрос
+    посреди слова в типичном случае."""
     if len(question) <= max_chars:
         return question
-    shortened = _shorten_question(model, question, max_chars)
+    shortened = _shorten_question(model, question, max_chars, is_stale=is_stale)
     if shortened and len(shortened) <= max_chars:
         return shortened
     return _trim_to_length(shortened or question, max_chars)
 
 
-def _finalize_questions(model: str, content: str, count: int) -> list[str]:
+def _finalize_questions(model: str, content: str, count: int, is_stale=None) -> list[str]:
     items = _parse_numbered_lines(content)[:count]
-    return [_enforce_max_length(model, q) for q in items]
+    return [_enforce_max_length(model, q, is_stale=is_stale) for q in items]
 
 
-def suggest_questions(model: str, hits: list[dict], count: int = SUGGEST_QUESTIONS_COUNT) -> list[str]:
+def suggest_questions(
+    model: str, hits: list[dict], count: int = SUGGEST_QUESTIONS_COUNT, is_stale=None, on_response=None,
+) -> list[str]:
     """По топ-N ближайших к вопросу фрагментов просит модель сформулировать вопрос,
     на который каждый из них отвечает — используется, когда исходный вопрос
     пользователя остался без ответа, чтобы предложить заведомо покрытые темы."""
+    if is_stale is not None and is_stale():
+        return []
+
     top_hits = hits[:count]
     if not top_hits:
         return []
@@ -277,15 +372,19 @@ def suggest_questions(model: str, hits: list[dict], count: int = SUGGEST_QUESTIO
     )
 
     try:
-        content = _chat(
+        content = _chat_cancellable(
             model,
             [{"role": "system", "content": SUGGEST_SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
             {"temperature": 0.4},
+            is_stale=is_stale,
+            on_response=on_response,
         )
     except Exception:
         return []
+    if content is None:
+        return []
 
-    return _finalize_questions(model, content, count)
+    return _finalize_questions(model, content, count, is_stale=is_stale)
 
 
 FOLLOWUP_QUESTIONS_COUNT = 3
@@ -300,14 +399,22 @@ FOLLOWUP_SYSTEM_PROMPT = (
 
 def suggest_followup_questions(
     collection, embedder, model: str, question: str, answer: str, used_hits: list[dict],
-    count: int = FOLLOWUP_QUESTIONS_COUNT,
+    count: int = FOLLOWUP_QUESTIONS_COUNT, is_stale=None, on_response=None,
 ) -> list[str]:
     """После УСПЕШНОГО ответа ищет ещё count фрагментов, не использованных в этом
     ответе (поиском по тексту самого ответа, а не исходного вопроса — так находятся
     смежные, а не те же самые куски), и просит модель сформулировать по вопросу на
     каждый — расширяющему уже полученный ответ. В отличие от suggest_questions()
     (для случая "ничего не нашлось"), тут материал гарантированно есть в индексе,
-    т.к. он реально извлечён поиском, а не придуман моделью."""
+    т.к. он реально извлечён поиском, а не придуман моделью.
+
+    is_stale() — необязательная проверка "а нужен ли ещё этот результат" (пользователь
+    мог успеть задать новый вопрос, пока этот генерировался): проверяется до начала
+    работы и между чанками ответа Ollama, чтобы не тратить GPU-время впустую и не
+    задерживать реально актуальный запрос в очереди."""
+    if is_stale is not None and is_stale():
+        return []
+
     exclude_ids = {h["id"] for h in used_hits if "id" in h}
     extra_hits = retrieve(collection, embedder, answer, count, exclude_ids=exclude_ids)
     if not extra_hits:
@@ -328,15 +435,19 @@ def suggest_followup_questions(
     )
 
     try:
-        content = _chat(
+        content = _chat_cancellable(
             model,
             [{"role": "system", "content": FOLLOWUP_SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
             {"temperature": 0.4},
+            is_stale=is_stale,
+            on_response=on_response,
         )
     except Exception:
         return []
+    if content is None:
+        return []
 
-    return _finalize_questions(model, content, count)
+    return _finalize_questions(model, content, count, is_stale=is_stale)
 
 
 def build_no_match_message(model: str, hits: list[dict]) -> str:

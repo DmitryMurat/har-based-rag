@@ -50,6 +50,54 @@ _ping_lock = threading.Lock()
 _active_requests = 0
 _active_lock = threading.Lock()
 
+# Инструмент один и локальный — предполагаем одну активную сессию (одну вкладку), поэтому
+# достаточно глобального счётчика поколений, а не per-session id. Новый /ask сразу же
+# инкрементирует его — это делает предыдущий запрос "устаревшим", даже если он ещё где-то
+# в процессе (генерация ответа или follow-up-вопросов), и позволяет прервать его вызовы к
+# Ollama на середине, вместо того чтобы они впустую держали GPU занятым и задерживали
+# реально актуальный запрос в очереди.
+_generation_lock = threading.Lock()
+_current_generation = 0
+# generation -> список ещё не закрытых requests.Response к Ollama для этого поколения.
+# is_stale(), проверяемый внутри ask.py между чанками, не спасает, пока запрос ещё не
+# получил от Ollama ни одного токена (заблокирован на первом чтении сокета) — тогда
+# его некому проверить изнутри. Единственный способ прервать такой запрос — закрыть
+# соединение форсированно СНАРУЖИ, из потока, который принял новый /ask.
+_active_ollama_responses: dict[int, list] = {}
+
+
+def _new_generation() -> int:
+    global _current_generation
+    with _generation_lock:
+        _current_generation += 1
+        new_generation = _current_generation
+        stale = {g: resps for g, resps in _active_ollama_responses.items() if g != new_generation}
+        for g in stale:
+            del _active_ollama_responses[g]
+    for resps in stale.values():
+        for resp in resps:
+            ask.force_close_response(resp)
+    return new_generation
+
+
+def _is_current(generation: int) -> bool:
+    with _generation_lock:
+        return generation == _current_generation
+
+
+def _register_ollama_response(generation: int, resp) -> None:
+    with _generation_lock:
+        # Если поколение уже устарело к моменту, когда Ollama наконец ответила заголовками
+        # (гонка с только что стартовавшим новым /ask) — закрываем сразу же, не дожидаясь
+        # следующего вызова _new_generation().
+        if generation != _current_generation:
+            still_current = False
+        else:
+            _active_ollama_responses.setdefault(generation, []).append(resp)
+            still_current = True
+    if not still_current:
+        ask.force_close_response(resp)
+
 # Склейка чанков урока в единый .ts (play_har.build_ts_bytes) — самая тяжёлая часть
 # проигрывания фрагмента: разбор HAR-файла (сотни МБ JSON) и base64-декод всех чанков.
 # Сама вырезка отрезка через ffmpeg — дёшево и зависит от конкретных start/end, поэтому
@@ -163,7 +211,7 @@ def audio(request: Request) -> Response:
         request_finished()
 
 
-def _ask_events(state, question: str, hits: list[dict]):
+def _ask_events(state, question: str, hits: list[dict], generation: int):
     """Генератор событий (dict) для потокового ответа — синхронный, читает Ollama
     через requests.iter_lines(). Starlette диспетчеризует его в threadpool через
     iterate_in_threadpool ниже, так что блокирующие вызовы не держат event loop.
@@ -174,12 +222,23 @@ def _ask_events(state, question: str, hits: list[dict]):
     каким будет ответ, нельзя — поэтому первые несколько символов придерживаем в
     буфере, чтобы отличить короткий маркер от начала настоящего ответа, и только
     после этого либо отдаём их как обычный текст, либо тихо заменяем на сообщение
-    "не нашлось" с подсказками, не показав пользователю сам маркер."""
+    "не нашлось" с подсказками, не показав пользователю сам маркер.
+
+    generation привязывает этот запрос к моменту его старта: если пользователь успел
+    задать новый вопрос (см. _new_generation() в ask_question), is_stale() вернёт True,
+    и все вызовы Ollama внутри (основной ответ, подсказки, follow-up) прерываются на
+    середине, а не тратят GPU впустую на уже никому не нужный результат."""
+    def is_stale() -> bool:
+        return not _is_current(generation)
+
+    def on_response(resp) -> None:
+        _register_ollama_response(generation, resp)
+
     threshold = len(ask.NO_ANSWER_SENTINEL) + 10
     buffer = ""
     flushed = False
     try:
-        for piece in ask.call_ollama_stream(ask.DEFAULT_MODEL, question, hits):
+        for piece in ask.call_ollama_stream(ask.DEFAULT_MODEL, question, hits, is_stale=is_stale, on_response=on_response):
             buffer += piece
             if flushed:
                 yield {"type": "chunk", "text": piece}
@@ -187,9 +246,12 @@ def _ask_events(state, question: str, hits: list[dict]):
                 flushed = True
                 yield {"type": "chunk", "text": buffer}
 
+        if is_stale():
+            return
+
         if not flushed:
             if ask.is_no_answer(buffer):
-                suggested = ask.suggest_questions(ask.DEFAULT_MODEL, hits)
+                suggested = ask.suggest_questions(ask.DEFAULT_MODEL, hits, is_stale=is_stale, on_response=on_response)
                 yield {
                     "type": "no_match",
                     "answer": ask.NO_MATCH_MESSAGE,
@@ -210,6 +272,7 @@ def _ask_events(state, question: str, hits: list[dict]):
         try:
             followups = ask.suggest_followup_questions(
                 state.collection, state.embedder, ask.DEFAULT_MODEL, question, buffer, hits,
+                is_stale=is_stale, on_response=on_response,
             )
             if followups:
                 yield {"type": "follow_ups", "questions": followups}
@@ -224,8 +287,8 @@ def _ask_events(state, question: str, hits: list[dict]):
         yield {"type": "error", "error": str(e)}
 
 
-async def _ndjson_body(state, question: str, hits: list[dict]):
-    async for event in iterate_in_threadpool(_ask_events(state, question, hits)):
+async def _ndjson_body(state, question: str, hits: list[dict], generation: int):
+    async for event in iterate_in_threadpool(_ask_events(state, question, hits, generation)):
         yield (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
 
 
@@ -234,6 +297,13 @@ async def ask_question(request: Request) -> Response:
     state = request.app.state
     if not state.ready.is_set():
         return JSONResponse({"error": "Модель ещё загружается, попробуйте через пару секунд"}, status_code=503)
+
+    # Каждый новый /ask сразу же становится "текущим поколением" — это делает любой ещё
+    # не завершившийся предыдущий запрос устаревшим (is_stale() внутри него начнёт
+    # возвращать True) прежде, чем мы вообще начали обрабатывать этот новый вопрос: не
+    # нужно ждать ни ответа Ollama, ни отключения клиента, чтобы освободить её для
+    # действительно актуального запроса.
+    my_generation = _new_generation()
 
     request_started()
     try:
@@ -247,10 +317,16 @@ async def ask_question(request: Request) -> Response:
 
         hits = await run_in_threadpool(ask.retrieve, state.collection, state.embedder, question, state.top_k)
         if not ask.has_relevant_match(hits):
-            suggested = await run_in_threadpool(ask.suggest_questions, ask.DEFAULT_MODEL, hits)
+            suggested = await run_in_threadpool(
+                ask.suggest_questions, ask.DEFAULT_MODEL, hits,
+                is_stale=lambda: not _is_current(my_generation),
+                on_response=lambda resp: _register_ollama_response(my_generation, resp),
+            )
             return JSONResponse({"answer": ask.NO_MATCH_MESSAGE, "sources": [], "suggested_questions": suggested})
 
-        return StreamingResponse(_ndjson_body(state, question, hits), media_type="application/x-ndjson; charset=utf-8")
+        return StreamingResponse(
+            _ndjson_body(state, question, hits, my_generation), media_type="application/x-ndjson; charset=utf-8",
+        )
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
     finally:
