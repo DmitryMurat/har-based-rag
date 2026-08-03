@@ -365,10 +365,17 @@ const statusPoll = setInterval(async () => {
   } catch (_) { /* сервер мог ещё не успеть подняться — просто попробуем на следующем тике */ }
 }, 500);
 
-// Heartbeat — пока страница открыта, сервер знает, что он ещё нужен.
+// Heartbeat — пока страница открыта, сервер знает, что он ещё нужен. В свёрнутой/
+// неактивной вкладке браузер троттлит setInterval вплоть до ~1 раза в минуту — сервер
+// это переживает за счёт запаса в HEARTBEAT_TIMEOUT (см. web.py), но дополнительно
+// шлём пинг сразу же при возврате фокуса/видимости, чтобы не ждать следующего тика.
 setInterval(() => {
   fetch("/ping").catch(() => {});
 }, 3000);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") fetch("/ping").catch(() => {});
+});
+window.addEventListener("focus", () => fetch("/ping").catch(() => {}));
 
 // Мгновенное закрытие сервера при закрытии/уходе со страницы.
 function notifyShutdown() {

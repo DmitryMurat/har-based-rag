@@ -43,7 +43,11 @@ from fastembed import TextEmbedding  # noqa: E402
 
 STATIC_HTML = (Path(__file__).resolve().parent / "web.html").read_text(encoding="utf-8")
 STATIC_CSS = (Path(__file__).resolve().parent / "styles.css").read_text(encoding="utf-8")
-HEARTBEAT_TIMEOUT = 15.0  # секунд без пинга от страницы — считаем, что вкладку закрыли
+# Секунд без пинга от страницы — считаем, что вкладку закрыли. Не может быть близко к
+# интервалу пинга (3с, см. web.html): фоновые вкладки браузер троттлит, замедляя
+# setInterval вплоть до ~1 раза в минуту, так что живая, но свёрнутая/неактивная
+# вкладка тоже должна пережить этот таймаут без ложного самоотключения сервера.
+HEARTBEAT_TIMEOUT = 90.0
 
 _last_ping = time.time()
 _ping_lock = threading.Lock()
