@@ -126,6 +126,33 @@ def _get_ts_bytes(cache_key: str, har_paths: list[Path]) -> bytes:
     return ts_bytes
 
 
+# Список уроков не меняется за время работы процесса — считаем один раз лениво (при
+# первом запросе на суммаризацию или на /audio-lesson), а не при каждом обращении.
+_lesson_index_cache: dict[int, list[str]] | None = None
+_lesson_index_lock = threading.Lock()
+
+
+def _get_lesson_index(collection) -> dict[int, list[str]]:
+    global _lesson_index_cache
+    with _lesson_index_lock:
+        if _lesson_index_cache is None:
+            _lesson_index_cache = ask.build_lesson_index(ask.list_item_names(collection))
+        return _lesson_index_cache
+
+
+def _resolve_har_paths(archive_dir: Path, item: str) -> list[Path] | None:
+    """{item}.har (+ {item}-start.har, если есть) — см. audio()/audio_lesson(). None,
+    если основного файла нет вовсе."""
+    har_path = archive_dir / f"{item}.har"
+    if not har_path.exists():
+        return None
+    har_paths = [har_path]
+    patch_path = archive_dir / f"{item}-start.har"
+    if patch_path.exists():
+        har_paths.append(patch_path)
+    return har_paths
+
+
 def touch() -> None:
     global _last_ping
     with _ping_lock:
@@ -177,19 +204,14 @@ def audio(request: Request) -> Response:
             return JSONResponse({"error": "Не указан item"}, status_code=400)
 
         archive_dir = request.app.state.archive_dir
-        har_path = archive_dir / f"{item}.har"
-        if not har_path.exists():
-            return JSONResponse({"error": f"HAR-файл не найден: {item}.har"}, status_code=404)
-
         # scripts/process.py --patch докрывает недостающие чанки начала записи отдельным
         # коротким HAR (обычно из-за того, что DevTools вытеснил старые тела запросов из
         # буфера при экспорте большого файла) и архивирует его рядом под тем же именем с
         # суффиксом "-start" — см. lesson12-start.har и т.п. Основной файл в этом случае не
         # содержит чанков начала, поэтому без патча начало записи не проигрывается.
-        har_paths = [har_path]
-        patch_path = archive_dir / f"{item}-start.har"
-        if patch_path.exists():
-            har_paths.append(patch_path)
+        har_paths = _resolve_har_paths(archive_dir, item)
+        if har_paths is None:
+            return JSONResponse({"error": f"HAR-файл не найден: {item}.har"}, status_code=404)
 
         try:
             start_raw = request.query_params.get("start")
@@ -202,6 +224,65 @@ def audio(request: Request) -> Response:
         try:
             ts_bytes = _get_ts_bytes(item, har_paths)
             audio_bytes = play_har.extract_audio_segment(ts_bytes, start, end)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+        return Response(audio_bytes, media_type="audio/wav")
+    finally:
+        touch()
+        request_finished()
+
+
+def audio_lesson(request: Request) -> Response:
+    """Проигрывает урок целиком по номеру (для чипа-источника суммаризации) — в отличие
+    от audio(), без start/end: всегда весь урок. Для уроков из нескольких частей
+    (lesson33-01/02/03 и т.п.) части склеиваются В ОДИН аудиопоток.
+
+    ВАЖНО: play_har.build_ts_bytes() нельзя вызвать сразу на har-файлы всех частей
+    одним списком — она сливает чанки по номеру индекса внутри потока (рассчитано на
+    "основной файл + его собственный -start-патч" с общим пространством индексов).
+    У независимо снятых частей индексы независимо начинаются от 0, и общий вызов молча
+    оставит только первую часть, отбросив остальные без исключения. Поэтому ts_bytes
+    получаем ОТДЕЛЬНО на каждую часть (как обычно для одного урока — с переиспользованием
+    того же LRU-кеша) и уже сырые TS-байты частей склеиваем сами, один раз извлекая
+    аудио из объединённого потока."""
+    touch()
+    request_started()
+    try:
+        lesson_raw = request.query_params.get("lesson") or ""
+        try:
+            lesson_number = int(lesson_raw)
+        except ValueError:
+            return JSONResponse({"error": "lesson должен быть числом"}, status_code=400)
+
+        state = request.app.state
+        lesson_index = _get_lesson_index(state.collection)
+        item_names = ask.resolve_lesson_item_names(lesson_index, lesson_number)
+        if not item_names:
+            return JSONResponse({"error": f"Урок {lesson_number} не найден"}, status_code=404)
+
+        cache_key = f"lesson{lesson_number}"
+        with _ts_cache_lock:
+            combined_ts = _ts_cache.get(cache_key)
+        if combined_ts is None:
+            ts_parts = []
+            for item in item_names:
+                har_paths = _resolve_har_paths(state.archive_dir, item)
+                if har_paths is None:
+                    return JSONResponse({"error": f"HAR-файл не найден: {item}.har"}, status_code=404)
+                ts_parts.append(_get_ts_bytes(item, har_paths))
+            combined_ts = b"".join(ts_parts)
+            with _ts_cache_lock:
+                _ts_cache[cache_key] = combined_ts
+                _ts_cache.move_to_end(cache_key)
+                while len(_ts_cache) > _TS_CACHE_MAX_ITEMS:
+                    _ts_cache.popitem(last=False)
+        else:
+            with _ts_cache_lock:
+                _ts_cache.move_to_end(cache_key)
+
+        try:
+            audio_bytes = play_har.extract_audio_segment(combined_ts, None, None)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -292,6 +373,63 @@ async def _ndjson_body(state, question: str, hits: list[dict], generation: int):
         yield (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+def _summary_events(lesson_number: int, lesson_label: str, transcript_text: str, length: str, generation: int):
+    """Как _ask_events(), но проще: пересказ всего транскрипта урока, а не ответ по
+    top_k фрагментам — тут не бывает NO_ANSWER (транскрипт уже гарантированно есть) и
+    не нужны no_match/follow_ups (это пересказ, а не вопрос-ответ, "расширять" нечего)."""
+    def is_stale() -> bool:
+        return not _is_current(generation)
+
+    def on_response(resp) -> None:
+        _register_ollama_response(generation, resp)
+
+    try:
+        for piece in ask.summarize_lesson_stream(
+            ask.DEFAULT_MODEL, lesson_label, transcript_text, length, is_stale=is_stale, on_response=on_response,
+        ):
+            yield {"type": "chunk", "text": piece}
+
+        if is_stale():
+            return
+
+        yield {
+            "type": "done",
+            "sources": [{"lesson_number": lesson_number, "label": lesson_label}],
+            "is_summary": True,
+        }
+    except GeneratorExit:
+        raise
+    except Exception as e:
+        yield {"type": "error", "error": str(e)}
+
+
+async def _summary_ndjson_body(lesson_number: int, lesson_label: str, transcript_text: str, length: str, generation: int):
+    events = _summary_events(lesson_number, lesson_label, transcript_text, length, generation)
+    async for event in iterate_in_threadpool(events):
+        yield (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+async def _handle_summary_request(state, classification: dict, generation: int, is_stale, on_response) -> Response:
+    lesson_number = classification["lesson_number"]
+    length = classification.get("length") or "default"
+
+    lesson_index = await run_in_threadpool(_get_lesson_index, state.collection)
+    item_names = ask.resolve_lesson_item_names(lesson_index, lesson_number)
+    if not item_names:
+        return JSONResponse({
+            "answer": f"Урок {lesson_number} не найден в загруженных видеоуроках.",
+            "sources": [], "suggested_questions": [],
+        })
+
+    transcript_text, _parts = await run_in_threadpool(ask.fetch_lesson_transcript, state.collection, item_names)
+    lesson_label = f"Урок {lesson_number}"
+
+    return StreamingResponse(
+        _summary_ndjson_body(lesson_number, lesson_label, transcript_text, length, generation),
+        media_type="application/x-ndjson; charset=utf-8",
+    )
+
+
 async def ask_question(request: Request) -> Response:
     touch()
     state = request.app.state
@@ -305,6 +443,12 @@ async def ask_question(request: Request) -> Response:
     # действительно актуального запроса.
     my_generation = _new_generation()
 
+    def is_stale() -> bool:
+        return not _is_current(my_generation)
+
+    def on_response(resp) -> None:
+        _register_ollama_response(my_generation, resp)
+
     request_started()
     try:
         try:
@@ -315,12 +459,19 @@ async def ask_question(request: Request) -> Response:
         if not question:
             return JSONResponse({"error": "Пустой вопрос"}, status_code=400)
 
+        classification = await run_in_threadpool(
+            ask.detect_summary_request, ask.DEFAULT_MODEL, question,
+            is_stale=is_stale, on_response=on_response,
+        )
+        if classification.get("is_summary") and classification.get("lesson_number"):
+            return await _handle_summary_request(state, classification, my_generation, is_stale, on_response)
+
         hits = await run_in_threadpool(ask.retrieve, state.collection, state.embedder, question, state.top_k)
         if not ask.has_relevant_match(hits):
             suggested = await run_in_threadpool(
                 ask.suggest_questions, ask.DEFAULT_MODEL, hits,
-                is_stale=lambda: not _is_current(my_generation),
-                on_response=lambda resp: _register_ollama_response(my_generation, resp),
+                is_stale=is_stale,
+                on_response=on_response,
             )
             return JSONResponse({"answer": ask.NO_MATCH_MESSAGE, "sources": [], "suggested_questions": suggested})
 
@@ -343,6 +494,7 @@ routes = [
     Route("/", index),
     Route("/styles.css", styles),
     Route("/audio", audio),
+    Route("/audio-lesson", audio_lesson),
     Route("/ping", ping),
     Route("/status", status),
     Route("/ask", ask_question, methods=["POST"]),

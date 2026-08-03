@@ -108,10 +108,9 @@ async function playSource(li) {
   stopPlayback();
   if (wasPlayingThis) return; // повторный клик по тому же фрагменту — просто остановить
 
-  const item = li.dataset.item;
-  const start = li.dataset.start;
-  const end = li.dataset.end;
-  const url = `/audio?item=${encodeURIComponent(item)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
+  const url = li.dataset.lesson !== undefined
+    ? `/audio-lesson?lesson=${encodeURIComponent(li.dataset.lesson)}`
+    : `/audio?item=${encodeURIComponent(li.dataset.item)}&start=${encodeURIComponent(li.dataset.start)}&end=${encodeURIComponent(li.dataset.end)}`;
 
   li.classList.add("loading");
   setStatus("");
@@ -189,12 +188,19 @@ function renderSuggestionsLoading() {
 function renderSources(sources) {
   if (!sources || !sources.length) return;
   const items = sources
-    .map(s => `<li data-item="${escapeHtml(s.item_name)}" data-start="${s.start}" data-end="${s.end}">` +
-      PLAY_ICON_HTML +
-      `<span class="src-info">` +
-      `<span class="src-lesson">${escapeHtml(s.item_name)}</span>` +
-      `<span class="src-time">${formatTimestamp(s.start)} - ${formatTimestamp(s.end)}</span>` +
-      `</span></li>`)
+    .map(s => s.lesson_number !== undefined
+      ? `<li data-lesson="${escapeHtml(String(s.lesson_number))}">` +
+        PLAY_ICON_HTML +
+        `<span class="src-info">` +
+        `<span class="src-lesson">${escapeHtml(s.label)}</span>` +
+        `<span class="src-time">Слушать полностью</span>` +
+        `</span></li>`
+      : `<li data-item="${escapeHtml(s.item_name)}" data-start="${s.start}" data-end="${s.end}">` +
+        PLAY_ICON_HTML +
+        `<span class="src-info">` +
+        `<span class="src-lesson">${escapeHtml(s.item_name)}</span>` +
+        `<span class="src-time">${formatTimestamp(s.start)} - ${formatTimestamp(s.end)}</span>` +
+        `</span></li>`)
     .join("");
   sourcesEl.innerHTML = '<ul class="chips">' + items + "</ul>";
 }
@@ -297,7 +303,7 @@ async function ask() {
         } else if (event.type === "done") {
           renderSources(event.sources);
           unlockInput();
-          if (event.sources && event.sources.length) {
+          if (event.sources && event.sources.length && !event.is_summary) {
             renderSuggestionsLoading();
             followupsPending = true;
           }

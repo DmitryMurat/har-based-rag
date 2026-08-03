@@ -450,6 +450,222 @@ def suggest_followup_questions(
     return _finalize_questions(model, content, count, is_stale=is_stale)
 
 
+# --- Суммаризация урока по номеру -------------------------------------------------
+# Отдельный путь от обычного RAG: вместо семантического поиска top_k похожих кусков —
+# точное извлечение ВСЕГО транскрипта конкретного урока по его номеру (пользователь
+# просит пересказ, а не ответ по содержанию) и генерация связного пересказа нужной
+# длины. Детектирование запроса — через классификацию LLM (а не regex): более надёжно
+# к формулировкам ценой одного лишнего короткого обращения к Ollama на каждый вопрос.
+
+SUMMARY_LENGTH_SENTENCES = {"brief": (2, 3), "default": (5, 10), "detailed": (15, 20)}
+
+SUMMARY_CLASSIFY_SYSTEM_PROMPT = (
+    "Ты классификатор запросов к базе видеоуроков. Определи, просит ли пользователь "
+    "ПЕРЕСКАЗ / КРАТКОЕ СОДЕРЖАНИЕ конкретного урока целиком по его номеру — а НЕ ответ "
+    "на предметный вопрос по материалу этого урока. Ключевой признак пересказа: "
+    "пользователя интересует, О ЧЁМ урок в целом, а не конкретный факт/шаг/настройка "
+    "из него. Просто упоминание номера урока внутри обычного вопроса — НЕ признак "
+    "пересказа.\n\n"
+    "Примеры (строго следуй этой логике):\n"
+    'Вопрос: "расскажи, о чём говорится в уроке 14"\n'
+    '{"is_summary": true, "lesson_number": 14, "length": "default"}\n\n'
+    'Вопрос: "дай краткую суммаризацию урока 5"\n'
+    '{"is_summary": true, "lesson_number": 5, "length": "brief"}\n\n'
+    'Вопрос: "подробно перескажи содержание 20 урока"\n'
+    '{"is_summary": true, "lesson_number": 20, "length": "detailed"}\n\n'
+    'Вопрос: "как в уроке 14 включить контроль дат в системе?"\n'
+    '{"is_summary": false, "lesson_number": null, "length": null}\n'
+    "(это предметный вопрос про конкретную настройку — просто отвечать нужно по "
+    "материалу урока 14, а не пересказывать его целиком)\n\n"
+    'Вопрос: "какие показатели можно включать или исключать из отчета?"\n'
+    '{"is_summary": false, "lesson_number": null, "length": null}\n'
+    "(номер урока вообще не назван — это обычный вопрос по теме)\n\n"
+    "Ответь СТРОГО одним JSON-объектом без пояснений, кода в разметке и текста "
+    "до/после — ровно как в примерах выше.\n\n"
+    "Поля:\n"
+    "- is_summary: true, только если пользователь явно просит пересказ/содержание/о чём "
+    "урок целиком, иначе false.\n"
+    "- lesson_number: номер урока целым числом, если он назван, иначе null.\n"
+    '- length: "brief", если просят кратко/коротко/вкратце; "detailed", если просят '
+    'подробно/детально/развёрнуто/полно; иначе "default". Если is_summary=false — null.'
+)
+
+
+def detect_summary_request(model: str, question: str, is_stale=None, on_response=None) -> dict:
+    """Классифицирует вопрос одним коротким вызовом Ollama. При любом сбое (сеть,
+    отмена, невалидный JSON, отсутствующие поля) — безопасно возвращает
+    {"is_summary": False, ...}, и вызывающий код просто идёт по обычному RAG-пути,
+    как будто классификации не было вовсе."""
+    fallback = {"is_summary": False, "lesson_number": None, "length": None}
+    try:
+        content = _chat_cancellable(
+            model,
+            [{"role": "system", "content": SUMMARY_CLASSIFY_SYSTEM_PROMPT}, {"role": "user", "content": question}],
+            {"temperature": 0.0},
+            is_stale=is_stale,
+            on_response=on_response,
+        )
+    except Exception:
+        return fallback
+    if content is None:
+        return fallback
+
+    try:
+        # Модель иногда оборачивает JSON в ```-блок несмотря на инструкцию — вырезаем.
+        match = re.search(r"\{.*\}", content, re.S)
+        data = json.loads(match.group(0) if match else content)
+    except (json.JSONDecodeError, AttributeError):
+        return fallback
+
+    if not isinstance(data, dict) or not data.get("is_summary"):
+        return fallback
+
+    lesson_number = data.get("lesson_number")
+    try:
+        lesson_number = int(lesson_number)
+    except (TypeError, ValueError):
+        return fallback
+    if lesson_number <= 0:
+        return fallback
+
+    length = data.get("length")
+    if length not in SUMMARY_LENGTH_SENTENCES:
+        length = "default"
+
+    return {"is_summary": True, "lesson_number": lesson_number, "length": length}
+
+
+_LESSON_NAME_RE = re.compile(r"^lesson0*(\d+)(?:-(\d+))?$")
+
+
+def list_item_names(collection) -> list[str]:
+    result = collection.get(include=["metadatas"])
+    return sorted({m["item_name"] for m in result["metadatas"]})
+
+
+def build_lesson_index(all_item_names: list[str]) -> dict[int, list[str]]:
+    """Разбирает item_name вида "lessonNN" / "lessonNN-PP" в {номер_урока: [item_names]}
+    один раз (список уроков за время работы процесса не меняется). Патч-файлы
+    "-start.har" тут ни при чём — они не порождают собственного item_name в индексе,
+    в списке метаданных чанков их в принципе не бывает."""
+    index: dict[int, list[tuple[int, str]]] = {}
+    for name in all_item_names:
+        m = _LESSON_NAME_RE.match(name)
+        if not m:
+            continue
+        lesson_number = int(m.group(1))
+        part_number = int(m.group(2)) if m.group(2) else 0
+        index.setdefault(lesson_number, []).append((part_number, name))
+    return {n: [name for _, name in sorted(parts)] for n, parts in index.items()}
+
+
+def resolve_lesson_item_names(lesson_index: dict[int, list[str]], lesson_number) -> list[str]:
+    try:
+        lesson_number = int(lesson_number)
+    except (TypeError, ValueError):
+        return []
+    return lesson_index.get(lesson_number, [])
+
+
+def fetch_lesson_transcript(collection, item_names: list[str]) -> tuple[str, list[dict]]:
+    """Достаёт ВСЕ чанки перечисленных item_names напрямую по метаданным (не
+    семантическим поиском), группирует по части, сортирует внутри части по start и
+    склеивает в один текст. Возвращает (текст, [{"item_name","start","end"} по частям
+    в порядке следования])."""
+    result = collection.get(where={"item_name": {"$in": item_names}}, include=["documents", "metadatas"])
+    parts: dict[str, dict] = {}
+    for doc, meta in zip(result["documents"], result["metadatas"]):
+        name = meta["item_name"]
+        part = parts.setdefault(name, {"chunks": [], "start": meta["start"], "end": meta["end"]})
+        part["chunks"].append((meta["start"], doc))
+        part["end"] = max(part["end"], meta["end"])
+        part["start"] = min(part["start"], meta["start"])
+
+    text_blocks = []
+    part_ranges = []
+    for name in item_names:
+        part = parts.get(name)
+        if not part:
+            continue
+        ordered_text = " ".join(text for _, text in sorted(part["chunks"], key=lambda c: c[0]))
+        text_blocks.append(ordered_text)
+        part_ranges.append({"item_name": name, "start": part["start"], "end": part["end"]})
+
+    return "\n\n".join(text_blocks), part_ranges
+
+
+_NUM_CTX_BUCKETS = (2048, 4096, 8192, 16384, 32768)
+
+
+def _estimate_num_ctx(text: str) -> int:
+    """Грубая оценка размера контекста под транскрипт: ~2 символа на токен (с запасом —
+    кириллица у BPE-токенизаторов обычно режется мельче латиницы) плюс ~2000 токенов на
+    системный промпт, обёртку и сам ответ. Округляется вверх до ближайшего "бакета" —
+    Ollama всё равно резервирует память под весь num_ctx, крупный запас без нужды
+    расточителен. Потолок — контекстное окно qwen2.5:7b (32768)."""
+    estimated_tokens = len(text) // 2 + 2000
+    for bucket in _NUM_CTX_BUCKETS:
+        if estimated_tokens <= bucket:
+            return bucket
+    return _NUM_CTX_BUCKETS[-1]
+
+
+SUMMARY_SYSTEM_PROMPT = (
+    "Ты помощник, который делает пересказ видеоурока по его полному текстовому "
+    "транскрипту. Пересказывай только то, что реально есть в транскрипте — не "
+    "добавляй фактов, шагов или подробностей из общих знаний, которых там нет.\n\n"
+    "Отвечай ИСКЛЮЧИТЕЛЬНО на русском языке. Никогда не используй китайский, "
+    "английский или любой другой язык — даже если транскрипт написан не на русском."
+)
+
+
+def build_summary_prompt(lesson_label: str, transcript_text: str, length: str) -> str:
+    lo, hi = SUMMARY_LENGTH_SENTENCES[length]
+    return (
+        f"Ниже — полный транскрипт видеоурока «{lesson_label}». Перескажи его "
+        f"содержание на русском языке в {lo}-{hi} предложениях, отражая основные темы "
+        "и ключевые факты по порядку изложения, без вступлений вида «в этом уроке» или "
+        "«данный транскрипт» — сразу по делу.\n\n"
+        f"Транскрипт:\n\n{transcript_text}"
+    )
+
+
+def summarize_lesson_stream(model: str, lesson_label: str, transcript_text: str, length: str, is_stale=None, on_response=None):
+    """Генератор кусков текста пересказа — зеркалит call_ollama_stream() по контракту
+    (те же is_stale/on_response хуки, тот же try/finally с resp.close()), отличается
+    промптом и явным num_ctx: транскрипт целого урока обычно заметно больше, чем
+    дефолтные 2048 токенов контекста Ollama, которых обычному Q&A (top_k коротких
+    фрагментов) хватало без специальной настройки."""
+    messages = [
+        {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+        {"role": "user", "content": build_summary_prompt(lesson_label, transcript_text, length)},
+    ]
+    options = {"temperature": 0.2, "num_ctx": _estimate_num_ctx(transcript_text)}
+    resp = requests.post(
+        OLLAMA_URL,
+        json={"model": model, "messages": messages, "stream": True, "options": options},
+        timeout=300,
+        stream=True,
+    )
+    resp.raise_for_status()
+    if on_response is not None:
+        on_response(resp)
+    try:
+        for line in resp.iter_lines():
+            if is_stale is not None and is_stale():
+                return
+            if not line:
+                continue
+            data = json.loads(line)
+            piece = data.get("message", {}).get("content", "")
+            if piece:
+                yield piece
+            if data.get("done"):
+                break
+    finally:
+        resp.close()
+
+
 def build_no_match_message(model: str, hits: list[dict]) -> str:
     message = NO_MATCH_MESSAGE
     questions = suggest_questions(model, hits)
