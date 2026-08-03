@@ -30,9 +30,23 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EMBED_MODEL = "intfloat/multilingual-e5-large"
 OLLAMA_URL = "http://localhost:11434/api/chat"
 DEFAULT_MODEL = "qwen2.5:7b"
-# Без этого Ollama выгружает модель из памяти через 5 минут простоя (значение по
+# Для вспомогательных задач (классификация запроса на пересказ, подсказки вопросов,
+# укорачивание) не нужно качество 7B — эти задачи проще, а более лёгкая модель
+# ощутимо быстрее отвечает. Основная генерация ответа/пересказа урока по-прежнему
+# идёт через DEFAULT_MODEL.
+AUX_MODEL = "qwen2.5:1.5b"
+# Без keep_alive Ollama выгружает модель из памяти через 5 минут простоя (значение по
 # умолчанию) — следующий вопрос после паузы платит цену повторной загрузки модели.
+# Для AUX_MODEL держим значительно короче: она маленькая и грузится быстро, а держать
+# обе модели в памяти одновременно долго — заметная лишняя нагрузка на RAM, особенно
+# на машинах, где память и так в дефиците.
 OLLAMA_KEEP_ALIVE = "30m"
+AUX_KEEP_ALIVE = "5m"
+
+
+def _keep_alive_for(model: str) -> str:
+    return AUX_KEEP_ALIVE if model == AUX_MODEL else OLLAMA_KEEP_ALIVE
+
 
 # Порог косинусного расстояния (1 - cos_sim) до ближайшего фрагмента, начиная с которого
 # считаем, что в индексе нет ничего релевантного вопросу — без реального совпадения ChromaDB
@@ -139,7 +153,7 @@ def build_prompt(question: str, hits: list[dict]) -> str:
 def _chat(model: str, messages: list[dict], options: dict) -> str:
     resp = requests.post(
         OLLAMA_URL,
-        json={"model": model, "messages": messages, "stream": False, "options": options, "keep_alive": OLLAMA_KEEP_ALIVE},
+        json={"model": model, "messages": messages, "stream": False, "options": options, "keep_alive": _keep_alive_for(model)},
         timeout=300,
     )
     resp.raise_for_status()
@@ -193,7 +207,7 @@ def _chat_cancellable(model: str, messages: list[dict], options: dict, is_stale=
     успевает выполниться ни разу."""
     resp = requests.post(
         OLLAMA_URL,
-        json={"model": model, "messages": messages, "stream": True, "options": options, "keep_alive": OLLAMA_KEEP_ALIVE},
+        json={"model": model, "messages": messages, "stream": True, "options": options, "keep_alive": _keep_alive_for(model)},
         timeout=300,
         stream=True,
     )
@@ -259,7 +273,7 @@ def call_ollama_stream(model: str, question: str, hits: list[dict], is_stale=Non
     ]
     resp = requests.post(
         OLLAMA_URL,
-        json={"model": model, "messages": messages, "stream": True, "options": {"temperature": 0.2}, "keep_alive": OLLAMA_KEEP_ALIVE},
+        json={"model": model, "messages": messages, "stream": True, "options": {"temperature": 0.2}, "keep_alive": _keep_alive_for(model)},
         timeout=300,
         stream=True,
     )
@@ -661,7 +675,7 @@ def summarize_lesson_stream(model: str, lesson_label: str, transcript_text: str,
     options = {"temperature": 0.2, "num_ctx": _estimate_num_ctx(transcript_text)}
     resp = requests.post(
         OLLAMA_URL,
-        json={"model": model, "messages": messages, "stream": True, "options": options, "keep_alive": OLLAMA_KEEP_ALIVE},
+        json={"model": model, "messages": messages, "stream": True, "options": options, "keep_alive": _keep_alive_for(model)},
         timeout=300,
         stream=True,
     )

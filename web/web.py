@@ -336,7 +336,7 @@ def _ask_events(state, question: str, hits: list[dict], generation: int):
 
         if not flushed:
             if ask.is_no_answer(buffer):
-                suggested = ask.suggest_questions(ask.DEFAULT_MODEL, hits, is_stale=is_stale, on_response=on_response)
+                suggested = ask.suggest_questions(ask.AUX_MODEL, hits, is_stale=is_stale, on_response=on_response)
                 yield {
                     "type": "no_match",
                     "answer": ask.NO_MATCH_MESSAGE,
@@ -356,7 +356,7 @@ def _ask_events(state, question: str, hits: list[dict], generation: int):
         # Ollama занята) не должен портить уже отданный ответ.
         try:
             followups = ask.suggest_followup_questions(
-                state.collection, state.embedder, ask.DEFAULT_MODEL, question, buffer, hits,
+                state.collection, state.embedder, ask.AUX_MODEL, question, buffer, hits,
                 is_stale=is_stale, on_response=on_response,
             )
             if followups:
@@ -464,7 +464,7 @@ async def ask_question(request: Request) -> Response:
             return JSONResponse({"error": "Пустой вопрос"}, status_code=400)
 
         classification = await run_in_threadpool(
-            ask.detect_summary_request, ask.DEFAULT_MODEL, question,
+            ask.detect_summary_request, ask.AUX_MODEL, question,
             is_stale=is_stale, on_response=on_response,
         )
         if classification.get("is_summary") and classification.get("lesson_number"):
@@ -473,7 +473,7 @@ async def ask_question(request: Request) -> Response:
         hits = await run_in_threadpool(ask.retrieve, state.collection, state.embedder, question, state.top_k)
         if not ask.has_relevant_match(hits):
             suggested = await run_in_threadpool(
-                ask.suggest_questions, ask.DEFAULT_MODEL, hits,
+                ask.suggest_questions, ask.AUX_MODEL, hits,
                 is_stale=is_stale,
                 on_response=on_response,
             )
