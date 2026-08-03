@@ -491,12 +491,27 @@ SUMMARY_CLASSIFY_SYSTEM_PROMPT = (
 )
 
 
+_SUMMARY_GATE_RE = re.compile(r"урок", re.IGNORECASE)
+
+
+def _might_be_summary_request(question: str) -> bool:
+    """Дешёвый pre-filter перед обращением к LLM: во всех реальных формулировках
+    запроса на пересказ упоминается и слово «урок» (в любом падеже), и номер урока
+    цифрами (см. примеры в SUMMARY_CLASSIFY_SYSTEM_PROMPT) — без этого классификация
+    гарантированно вернёт is_summary=False, и полный round-trip к Ollama можно не
+    тратить. Компромисс: вопрос вида «перескажи четырнадцатый урок» без цифр гейт
+    отфильтрует, не дойдя до LLM — на практике такая формулировка не встречалась."""
+    return bool(_SUMMARY_GATE_RE.search(question)) and any(ch.isdigit() for ch in question)
+
+
 def detect_summary_request(model: str, question: str, is_stale=None, on_response=None) -> dict:
     """Классифицирует вопрос одним коротким вызовом Ollama. При любом сбое (сеть,
     отмена, невалидный JSON, отсутствующие поля) — безопасно возвращает
     {"is_summary": False, ...}, и вызывающий код просто идёт по обычному RAG-пути,
     как будто классификации не было вовсе."""
     fallback = {"is_summary": False, "lesson_number": None, "length": None}
+    if not _might_be_summary_request(question):
+        return fallback
     try:
         content = _chat_cancellable(
             model,
